@@ -2,28 +2,24 @@
 #define RL_INTERFACE_H
 
 #include "ns3/object.h"
-#include <zmq.hpp>
 #include <string>
-#include <vector>
+#include <map>
+#include <zmq.hpp>
+#include <nlohmann/json.hpp>
 
 namespace ns3 {
 
-class RLInterface : public Object {
+class RLInterface : public Object
+{
 public:
-  static TypeId GetTypeId(void) {
-    static TypeId tid = TypeId("ns3::RLInterface")
-      .SetParent<Object>()
-      .SetGroupName("Core");
-    return tid;
-  }
-
+  static TypeId GetTypeId(void);
   RLInterface();
-  RLInterface(const std::string& addr);
-  ~RLInterface();
+  RLInterface(const std::string &addr);
+  ~RLInterface() override;
 
-  void Init(const std::string& addr);
-  void SendState(const std::vector<double>& state);
-  int ReceiveAction();
+  void Init(const std::string &addr);
+  void SendState(const std::map<std::string, double> &state);
+  nlohmann::json ReceiveAction();
   void SendReward(double reward, bool done);
 
 private:
@@ -34,4 +30,4 @@ private:
 
 } // namespace ns3
 
-#endif // RL_INTERFACE_H
+#endif

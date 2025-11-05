@@ -32,6 +32,22 @@ static uint32_t g_nodes = 0;
 static double   g_beaconHz = 0.0;
 static const double kStatusEvery = 2.0; // seconds
 
+// Network performance metrics (updated every RL step)
+static double g_pdr = 0.0;
+static double g_throughput = 0.0;
+static double g_delay = 0.0;
+static double g_collisions = 0.0;
+
+// Reward weights
+static const double alpha = 0.4;
+static const double beta  = 0.4;
+static const double gammaW = 0.1;
+static const double delta = 0.1;
+
+// FlowMonitor pointer (so RL can read stats dynamically)
+static Ptr<FlowMonitor> g_flowmon;
+
+
 // keep pointers to all periodic apps so RL can change their frequency
 static std::vector<Ptr<class PeriodicBroadcastApp>> g_allApps;
 
@@ -189,46 +205,96 @@ static void PositionVehicles(const NodeContainer& nodes, uint32_t lanes, uint32_
   }
 }
 
+static void UpdateNetworkMetrics()
+{
+    if (!g_flowmon) return;
+
+    g_flowmon->CheckForLostPackets();
+    auto stats = g_flowmon->GetFlowStats();
+
+    double totalRx = 0.0, totalTx = 0.0;
+    double totalDelay = 0.0;
+    uint32_t flowCount = 0;
+
+    for (auto &p : stats)
+    {
+        const auto &st = p.second;
+        totalTx += st.txPackets;
+        totalRx += st.rxPackets;
+        if (st.rxPackets > 0)
+        {
+            totalDelay += st.delaySum.GetSeconds() / st.rxPackets;
+        }
+        flowCount++;
+    }
+
+    g_pdr = (totalTx > 0) ? (totalRx / totalTx) : 0.0;
+    g_delay = (flowCount > 0) ? (totalDelay / flowCount) : 0.0;
+    g_throughput = (totalRx * g_payloadBytes * 8.0) / Simulator::Now().GetSeconds(); // bits/sec
+    g_throughput /= 1e6; // normalize to Mbps
+    g_collisions = 1.0 - g_pdr; // rough proxy for collision rate
+
+    // Normalize metrics for reward (approx)
+    g_throughput = std::min(g_throughput / 10.0, 1.0); // assume 10 Mbps max
+    g_delay = std::min(g_delay / 0.5, 1.0);            // assume 0.5s max delay
+}
+
 // -------- RL step function --------
 void RlStep()
 {
     double simTime = Simulator::Now().GetSeconds();
-    double metric = (simTime > 0) ? double(g_txCount) / simTime : 0.0;
+    UpdateNetworkMetrics();
 
-    // Debug print
-    std::cout << "[RL] t=" << simTime << " metric(tx/s)=" << metric << " beaconHz=" << g_beaconHzDynamic << std::endl;
+    // Compute reward
+    double reward = (alpha * g_pdr + beta * g_throughput) - (gammaW * g_delay + delta * g_collisions);
 
-    // Send observation to agent
+    std::cout << std::fixed << std::setprecision(3)
+              << "[RL] t=" << simTime
+              << "  PDR=" << g_pdr
+              << "  Thr=" << g_throughput
+              << "  Delay=" << g_delay
+              << "  Coll=" << g_collisions
+              << "  Reward=" << reward
+              << "  BeaconHz=" << g_beaconHzDynamic
+              << std::endl;
+
     if (g_rl)
     {
-      g_rl->SendState(std::vector<double>{metric});
-      int action = g_rl->ReceiveAction(); // expect small integer
+        std::map<std::string, double> state = {
+          {"PDR", g_pdr},
+          {"Throughput", g_throughput},
+          {"Delay", g_delay},
+          {"Collisions", g_collisions},
+          {"Time", simTime}
+      };
 
-      // Interpret action: 0 = -1 Hz, 1 = keep, 2 = +1 Hz
-      if (action == 0) g_beaconHzDynamic = std::max(1.0, g_beaconHzDynamic - 1.0);
-      else if (action == 2) g_beaconHzDynamic = std::min(50.0, g_beaconHzDynamic + 1.0);
+        g_rl->SendState(state);
+        auto jaction = g_rl->ReceiveAction();
 
-      // Apply to all apps (will take effect from next scheduled tick)
-      for (auto &app : g_allApps)
-      {
-        if (app)
+        if (jaction.contains("action") && jaction["action"].is_object())
         {
-          app->SetBeaconFrequency(g_beaconHzDynamic);
+            auto act = jaction["action"];
+            if (act.contains("beaconHz"))
+                g_beaconHzDynamic = act["beaconHz"];
         }
-      }
 
-      // Reward: example = current metric (you should shape this)
-      double reward = metric;
-      g_rl->SendReward(reward, false);
+        // Apply to all apps
+        for (auto &app : g_allApps)
+        {
+            if (app) app->SetBeaconFrequency(g_beaconHzDynamic);
+        }
+
+        g_rl->SendReward(reward, false);
     }
     else
     {
-      std::cout << "[RL] g_rl is null; skipping RL step\n";
+        std::cout << "[RL] g_rl is null; skipping RL step\n";
     }
 
     // schedule next step in 1s
     Simulator::Schedule(Seconds(1.0), &RlStep);
 }
+
 
 int main (int argc, char *argv[])
 {
@@ -237,7 +303,7 @@ int main (int argc, char *argv[])
   double laneSpacing = 4.0;
   double vehSpacing  = 7.0;
   double speed = 30.0;
-  double simTime = 900.0;
+  double simTime = 3600.0;
   uint32_t payloadBytes = 1200;
   double beaconHz = 10.0;
   bool enablePcap = false;
@@ -343,7 +409,10 @@ int main (int argc, char *argv[])
 
   FlowMonitorHelper fm;
   Ptr<FlowMonitor> mon;
-  if (enableFlowmon) { mon = fm.InstallAll(); }
+  if (enableFlowmon) {
+    mon = fm.InstallAll(); 
+    g_flowmon = mon;
+  }
 
   // Schedule periodic console status
   Simulator::Schedule(Seconds(kStatusEvery), &StatusTick, simTime);
