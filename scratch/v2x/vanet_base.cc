@@ -20,21 +20,11 @@ NS_LOG_COMPONENT_DEFINE("VehicularWifiHeavy");
 
 // -------- Helpers for status formatting --------
 static uint64_t g_txCount = 0;
-static uint64_t g_rxCount = 0;
 static uint64_t g_expectedTx = 0;
 static uint32_t g_payloadBytes = 0;
 static uint32_t g_nodes = 0;
 static double   g_beaconHz = 0.0;
 static const double kStatusEvery = 2.0; // seconds
-static const double kMetricsEvery = 1.0; // seconds for metrics collection
-
-// Metrics tracking
-static uint64_t g_lastTxCount = 0;
-static uint64_t g_lastRxCount = 0;
-static std::ofstream g_metricsLog;
-
-// FlowMonitor reference for periodic collection
-static Ptr<FlowMonitor> g_flowMonitor;
 
 static std::string HumanBytes(double bpsOrBytesPerSec, bool perSec)
 {
@@ -86,7 +76,7 @@ static void StatusTick(double simTime)
   double eta = std::max(0.0, simTime - now);
   double txRate = now > 0 ? static_cast<double>(g_txCount) / now : 0.0;
   double bytesPerSec = txRate * static_cast<double>(g_payloadBytes);
-  size_t rssKb = GetVmRSSKb();
+  size_t rssKb = GetVmRSSKb(); // resident set size in kb how much ram the running process currently uses
 
   std::ostringstream bar;
   int width = 30;
@@ -101,7 +91,6 @@ static void StatusTick(double simTime)
             << "ETA " << std::setprecision(0) << eta << "s  |  "
             << "TX " << HumanCount(g_txCount) << " pkts "
             << "(" << std::setprecision(1) << txRate << "/s),  "
-            << "RX " << HumanCount(g_rxCount) << " pkts,  "
             << "Data ~" << HumanBytes(bytesPerSec, true) << "  |  "
             << "RSS " << (rssKb / 1024) << " MB"
             << std::endl;
@@ -109,96 +98,6 @@ static void StatusTick(double simTime)
   if (now + kStatusEvery <= simTime)
   {
     Simulator::Schedule(Seconds(kStatusEvery), &StatusTick, simTime);
-  }
-}
-
-// -------- Periodic Metrics Collection --------
-static void CollectMetrics(double simTime)
-{
-  double now = Simulator::Now().GetSeconds();
-  
-  // Calculate instantaneous rates since last collection
-  uint64_t txDelta = g_txCount - g_lastTxCount;
-  uint64_t rxDelta = g_rxCount - g_lastRxCount;
-  double txRate = txDelta / kMetricsEvery;
-  double rxRate = rxDelta / kMetricsEvery;
-  double throughput = (rxDelta * g_payloadBytes * 8) / (kMetricsEvery * 1000000.0); // Mbps
-  
-  // Update last counts
-  g_lastTxCount = g_txCount;
-  g_lastRxCount = g_rxCount;
-  
-  // FlowMonitor metrics
-  double avgDelay = 0.0;
-  double pdr = 0.0; // Packet Delivery Ratio
-  uint64_t totalTxPackets = 0;
-  uint64_t totalRxPackets = 0;
-  
-  if (g_flowMonitor)
-  {
-    g_flowMonitor->CheckForLostPackets();
-    
-    FlowMonitor::FlowStatsContainer stats = g_flowMonitor->GetFlowStats();
-    
-    double totalDelaySum = 0.0;
-    uint64_t totalDelayPackets = 0;
-    
-    for (auto const& flow : stats)
-    {
-      totalTxPackets += flow.second.txPackets;
-      totalRxPackets += flow.second.rxPackets;
-      
-      if (flow.second.rxPackets > 0)
-      {
-        totalDelaySum += flow.second.delaySum.GetSeconds();
-        totalDelayPackets += flow.second.rxPackets;
-      }
-    }
-    
-    if (totalDelayPackets > 0)
-    {
-      avgDelay = (totalDelaySum / totalDelayPackets) * 1000.0; // Convert to ms
-    }
-    
-    if (totalTxPackets > 0)
-    {
-      pdr = (static_cast<double>(totalRxPackets) / static_cast<double>(totalTxPackets)) * 100.0;
-    }
-  }
-  
-  // Log metrics to file
-  if (g_metricsLog.is_open())
-  {
-    g_metricsLog << std::fixed << std::setprecision(6)
-                 << now << ","
-                 << g_txCount << ","
-                 << g_rxCount << ","
-                 << std::setprecision(2)
-                 << txRate << ","
-                 << rxRate << ","
-                 << throughput << ","
-                 << avgDelay << ","
-                 << pdr << ","
-                 << totalTxPackets << ","
-                 << totalRxPackets
-                 << std::endl;
-  }
-  
-  // Console output for debugging
-  std::cout << "[METRICS] t=" << std::fixed << std::setprecision(2) << now << "s: "
-            << "TX=" << g_txCount << ", RX=" << g_rxCount << ", "
-            << "TxRate=" << std::setprecision(1) << txRate << " pkt/s, "
-            << "RxRate=" << rxRate << " pkt/s, "
-            << "Throughput=" << std::setprecision(2) << throughput << " Mbps, "
-            << "AvgDelay=" << std::setprecision(3) << avgDelay << " ms, "
-            << "PDR=" << std::setprecision(2) << pdr << "%"
-            << " [PhyDrops=" << g_phyRxDropCount << "]"
-            << std::endl;
-  
-  // Schedule next collection
-  if (now + kMetricsEvery <= simTime)
-  {
-    Simulator::Schedule(Seconds(kMetricsEvery), &CollectMetrics, simTime);
   }
 }
 
@@ -215,17 +114,10 @@ public:
 private:
   void StartApplication() override
   {
-    // RX socket for receiving broadcasts (bind first!)
-    m_rxSock = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
-    m_rxSock->SetAllowBroadcast(true);
-    m_rxSock->Bind(InetSocketAddress(Ipv4Address::GetAny(), m_port));
-    m_rxSock->SetRecvCallback(MakeCallback(&PeriodicBroadcastApp::HandleRead, this));
-
-    // TX socket for broadcasting
-    m_txSock = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
-    m_txSock->SetAllowBroadcast(true);
-    // Don't bind TX socket - just connect for sending
-    m_txSock->Connect(InetSocketAddress(Ipv4Address("255.255.255.255"), m_port));
+    m_sock = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+    m_sock->SetAllowBroadcast(true);
+    m_sock->Bind();
+    m_sock->Connect(InetSocketAddress(Ipv4Address("255.255.255.255"), m_port));
 
     Ptr<UniformRandomVariable> rng = CreateObject<UniformRandomVariable>();
     Time jitter = Seconds(rng->GetValue(0.0, m_interval.GetSeconds()));
@@ -233,53 +125,22 @@ private:
   }
   void StopApplication() override
   {
-    if (m_event.IsRunning()) Simulator::Cancel(m_event);
-    if (m_txSock) m_txSock->Close();
-    if (m_rxSock) 
-    {
-      m_rxSock->SetRecvCallback(MakeNullCallback<void, Ptr<Socket>>());
-      m_rxSock->Close();
-    }
+    if (m_event.IsPending()) Simulator::Cancel(m_event);
+    if (m_sock) m_sock->Close();
   }
   void Tick()
   {
-    m_txSock->Send(Create<Packet>(m_payloadBytes));
+    m_sock->Send(Create<Packet>(m_payloadBytes));
     ++g_txCount;
     m_event = Simulator::Schedule(m_interval, &PeriodicBroadcastApp::Tick, this);
   }
-  void HandleRead(Ptr<Socket> socket)
-  {
-    Ptr<Packet> packet;
-    Address from;
-    while ((packet = socket->RecvFrom(from)))
-    {
-      if (packet->GetSize() > 0)
-      {
-        ++g_rxCount;
-      }
-    }
-  }
 private:
-  Ptr<Socket> m_txSock;
-  Ptr<Socket> m_rxSock;
+  Ptr<Socket> m_sock;
   uint16_t m_port{4444};
   uint32_t m_payloadBytes{300};
   Time m_interval{Seconds(0.1)};
   EventId m_event;
 };
-
-// -------- PHY-level RX Callback --------
-static void PhyRxOkTrace(Ptr<const Packet> packet)
-{
-  ++g_rxCount;
-}
-
-// Debug callback for monitoring
-static uint64_t g_phyRxDropCount = 0;
-static void PhyRxDropTrace(Ptr<const Packet> packet, WifiPhyRxfailureReason reason)
-{
-  ++g_phyRxDropCount;
-}
 
 // -------- Topology / main --------
 static void
@@ -386,15 +247,6 @@ int main (int argc, char *argv[])
   NodeContainer nodes; nodes.Create(n);
   NetDeviceContainer devs = wifi.Install(phy, mac, nodes);
 
-  // Connect PHY-level traces to count received and dropped packets
-  for (uint32_t i = 0; i < devs.GetN(); ++i)
-  {
-    Ptr<WifiNetDevice> wifiDev = DynamicCast<WifiNetDevice>(devs.Get(i));
-    Ptr<WifiPhy> wifiPhy = wifiDev->GetPhy();
-    wifiPhy->TraceConnectWithoutContext("PhyRxEnd", MakeCallback(&PhyRxOkTrace));
-    wifiPhy->TraceConnectWithoutContext("PhyRxDrop", MakeCallback(&PhyRxDropTrace));
-  }
-
   InternetStackHelper internet;
   internet.Install(nodes);
   Ipv4AddressHelper ip;
@@ -404,8 +256,12 @@ int main (int argc, char *argv[])
   PositionVehicles(nodes, lanes, vehPerLane, laneSpacing, vehSpacing, speed);
 
   uint16_t port = 4444;
+  PacketSinkHelper sinkHelper("ns3::UdpSocketFactory",
+                              InetSocketAddress(Ipv4Address::GetAny(), port));
+  ApplicationContainer sinks = sinkHelper.Install(nodes);
+  sinks.Start(Seconds(0.0));
+  sinks.Stop(Seconds(simTime));
 
-  // Install broadcast applications on all nodes
   for (uint32_t i = 0; i < nodes.GetN(); ++i)
   {
     Ptr<PeriodicBroadcastApp> app = CreateObject<PeriodicBroadcastApp>();
@@ -418,62 +274,31 @@ int main (int argc, char *argv[])
   if (enablePcap) { phy.EnablePcapAll("vehicular-wifi-heavy", true); }
 
   FlowMonitorHelper fm;
-  if (enableFlowmon) 
-  { 
-    g_flowMonitor = fm.InstallAll(); 
-  }
-
-  // Open metrics log file
-  g_metricsLog.open("vehicular-wifi-metrics.csv");
-  if (g_metricsLog.is_open())
-  {
-    // Write CSV header
-    g_metricsLog << "time,tx_total,rx_total,tx_rate,rx_rate,throughput_mbps,avg_delay_ms,pdr_percent,flowmon_tx,flowmon_rx" << std::endl;
-    std::cout << "Metrics logging enabled: vehicular-wifi-metrics.csv" << std::endl;
-  }
-  else
-  {
-    std::cerr << "Warning: Could not open metrics log file!" << std::endl;
-  }
+  Ptr<FlowMonitor> mon;
+  if (enableFlowmon) { mon = fm.InstallAll(); }
 
   // Schedule periodic console status
   Simulator::Schedule(Seconds(kStatusEvery), &StatusTick, simTime);
-  
-  // Schedule periodic metrics collection
-  Simulator::Schedule(Seconds(kMetricsEvery), &CollectMetrics, simTime);
 
   Simulator::Stop(Seconds(simTime));
   Simulator::Run();
 
-  // Close metrics log
-  if (g_metricsLog.is_open())
-  {
-    g_metricsLog.close();
-    std::cout << "Metrics log closed." << std::endl;
-  }
-
   // Final summary
   double now = Simulator::Now().GetSeconds();
   double txRate = now > 0 ? static_cast<double>(g_txCount) / now : 0.0;
-  double rxRate = now > 0 ? static_cast<double>(g_rxCount) / now : 0.0;
   double bytesPerSec = txRate * static_cast<double>(g_payloadBytes);
-  double pdr = g_txCount > 0 ? (static_cast<double>(g_rxCount) / static_cast<double>(g_txCount)) * 100.0 : 0.0;
   size_t rssKb = GetVmRSSKb();
 
   std::cout << "=== Completed ===" << std::endl
             << "Sim time: " << now << " s" << std::endl
             << "TX total: " << g_txCount << " pkts (expected ~" << g_expectedTx << ")" << std::endl
-            << "RX total: " << g_rxCount << " pkts (PHY level)" << std::endl
-            << "PHY RX drops: " << g_phyRxDropCount << " pkts" << std::endl
             << "Avg TX rate: " << std::setprecision(1) << txRate << " pkt/s, "
-            << "Avg RX rate: " << rxRate << " pkt/s" << std::endl
             << "Avg data: " << HumanBytes(bytesPerSec, true) << std::endl
-            << "Overall PDR: " << std::setprecision(2) << pdr << "%" << std::endl
             << "Final RSS: " << (rssKb / 1024) << " MB" << std::endl;
 
-  if (enableFlowmon && g_flowMonitor)
+  if (enableFlowmon)
   {
-    g_flowMonitor->CheckForLostPackets();
+    mon->CheckForLostPackets();
     fm.SerializeToXmlFile("vehicular-wifi-heavy.flowmon.xml", true, true);
     std::cout << "FlowMonitor: wrote vehicular-wifi-heavy.flowmon.xml" << std::endl;
   }
