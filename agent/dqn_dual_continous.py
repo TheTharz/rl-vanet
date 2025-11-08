@@ -1,59 +1,23 @@
 """
-Simple Continuous DQN Agent for VANET - BeaconHz Only
-========================================================
+Dual-Control Continuous DQN Agent for VANET - BeaconHz + TxPower
+===================================================================
 
-EXPLANATION OF DQN AND EPISODES:
----------------------------------
+This agent controls BOTH:
+1. BeaconHz (beacon frequency): 2-12 Hz
+2. TxPower (transmission power): 15-30 dBm
 
-1. WHAT IS DQN (Deep Q-Network)?
-   - DQN is a reinforcement learning algorithm that learns to make decisions
-   - It uses a neural network to estimate Q-values (quality of actions)
-   - Q-value = expected future reward for taking action A in state S
-   - The agent learns which actions lead to better outcomes over time
+ACTION SPACE:
+- BeaconHz options: [2, 4, 6, 8, 10, 12] Hz (6 options)
+- TxPower options: [15, 18, 21, 23, 26, 30] dBm (6 options)
+- Total actions: 6 × 6 = 36 discrete actions
 
-2. HOW DQN WORKS:
-   Step 1: Observe current state (PDR, throughput, neighbors, etc.)
-   Step 2: Choose action (change beaconHz) using epsilon-greedy:
-           - With probability ε: explore (random action)
-           - With probability 1-ε: exploit (best known action)
-   Step 3: Execute action in environment (NS3 simulation)
-   Step 4: Receive reward based on performance
-   Step 5: Store experience (state, action, reward, next_state)
-   Step 6: Learn from past experiences using "Experience Replay"
-   Step 7: Update Q-value estimates to improve future decisions
+Each action combines one BeaconHz with one TxPower setting.
 
-3. WHAT ARE EPISODES?
-   Traditional RL:
-   - Episode = one complete run of a simulation from start to finish
-   - Like playing one game of chess or one race in a driving sim
-   - Episode ends when reaching terminal state (crash, finish, timeout)
-   
-   In your case (OLD approach with 10 runs):
-   - You run NS3 simulation 10 separate times
-   - Each run = 1 episode
-   - Agent resets between runs
-   - Problem: Inefficient, not real-time adaptive
-
-4. CONTINUOUS LEARNING (NEW approach - what we're doing here):
-   - ONE long-running NS3 simulation
-   - Agent learns continuously while simulation runs
-   - No episodes - just continuous decision making
-   - More realistic: adapts in real-time like a real system would
-   - Steps = decision points (every time agent gets new state)
-
-5. KEY DQN COMPONENTS:
-   a) Policy Network: Neural net that outputs Q-values for each action
-   b) Target Network: Stable copy of policy net (updated slowly)
-   c) Replay Buffer: Memory of past experiences for learning
-   d) Epsilon-greedy: Balance between exploration and exploitation
-   e) Bellman Equation: Q(s,a) = reward + γ * max Q(next_state, next_action)
-
-6. THIS IMPLEMENTATION (Continuous, BeaconHz only):
-   - No episodes! Just continuous learning
-   - Only controls beacon frequency (2-12 Hz)
-   - Keeps txPower fixed at 23 dBm
-   - Learns from every state transition
-   - Adapts in real-time to changing network conditions
+LEARNING APPROACH:
+- Continuous learning (no episodes)
+- DQN with experience replay
+- Epsilon-greedy exploration
+- Dual target: optimize both communication frequency and transmission power
 """
 
 import zmq
@@ -80,22 +44,27 @@ except ImportError:
 Experience = namedtuple('Experience', ['state', 'action', 'reward', 'next_state', 'done'])
 
 
-class DQNNetwork(nn.Module):
+class DualDQNNetwork(nn.Module):
     """
-    Simple Deep Q-Network for beacon frequency control
-    Input: 8 state features (removed txPower since we don't control it)
-    Output: 6 Q-values (one for each beacon frequency option)
+    Deep Q-Network for dual control (BeaconHz + TxPower)
+    Input: 9 state features (including both beaconHz and txPower)
+    Output: 36 Q-values (6 beaconHz × 6 txPower options)
     """
     
-    def __init__(self, state_dim=8, action_dim=6, hidden_size=64):
-        super(DQNNetwork, self).__init__()
+    def __init__(self, state_dim=9, action_dim=36, hidden_size=128):
+        super(DualDQNNetwork, self).__init__()
         
+        # Larger network for more complex action space
         self.network = nn.Sequential(
             nn.Linear(state_dim, hidden_size),
             nn.ReLU(),
+            nn.Dropout(0.2),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_size, action_dim)
+            nn.Dropout(0.2),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, action_dim)
         )
     
     def forward(self, x):
@@ -106,10 +75,9 @@ class ReplayBuffer:
     """
     Experience Replay Buffer
     Stores past experiences and samples random batches for training
-    This breaks temporal correlations and improves learning stability
     """
     
-    def __init__(self, capacity=5000):
+    def __init__(self, capacity=10000):
         self.buffer = deque(maxlen=capacity)
     
     def push(self, experience):
@@ -124,28 +92,25 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-class ContinuousDQNAgent:
+class DualControlDQNAgent:
     """
-    Continuous Learning DQN Agent for VANET BeaconHz Control
+    Continuous Learning DQN Agent for VANET with Dual Control
     
-    This agent:
-    - Learns continuously (no episodes)
-    - Only controls beacon frequency (beaconHz)
-    - Keeps txPower fixed at 23 dBm
-    - Updates neural network after each step
-    - Uses experience replay for stable learning
+    Controls both:
+    - BeaconHz: Communication frequency (2-12 Hz)
+    - TxPower: Transmission power (15-30 dBm)
     """
     
     def __init__(self, 
-                 state_dim=8,           # 8 state features (no txPower)
-                 learning_rate=0.001,   # How fast to learn
-                 gamma=0.95,            # Discount factor (how much to value future rewards)
+                 state_dim=9,           # 9 state features (including both beaconHz and txPower)
+                 learning_rate=0.0003,   # Learning rate
+                 gamma=0.99,            # Discount factor
                  epsilon_start=1.0,     # Initial exploration rate
-                 epsilon_end=0.1,       # Minimum exploration rate
-                 epsilon_decay=0.9995,  # Decay rate per step
-                 buffer_size=5000,      # Replay buffer capacity
-                 batch_size=32,         # Training batch size
-                 target_update_freq=100): # Update target network every N steps
+                 epsilon_end=0.05,      # Minimum exploration rate
+                 epsilon_decay=0.9995,  # Decay rate per step (slower for larger action space)
+                 buffer_size=20000,     # Larger buffer for dual control
+                 batch_size=64,         # Training batch size
+                 target_update_freq=250): # Update target network frequency
         
         self.state_dim = state_dim
         self.gamma = gamma
@@ -156,26 +121,37 @@ class ContinuousDQNAgent:
         self.target_update_freq = target_update_freq
         self.step_counter = 0
         
-        # SIMPLIFIED ACTION SPACE: Only beacon frequency
-        # BeaconHz options: [2, 4, 6, 8, 10, 12] Hz
+        # DUAL ACTION SPACE
+        # BeaconHz options: 6 choices
         self.beacon_options = [2, 4, 6, 8, 10, 12]
-        self.action_dim = len(self.beacon_options)
+        # TxPower options: 6 choices
+        self.txpower_options = [15, 18, 21, 23, 26, 30]
         
-        # Fixed txPower
-        self.fixed_tx_power = 23  # dBm
+        # Total action space: 6 × 6 = 36 actions
+        self.action_dim = len(self.beacon_options) * len(self.txpower_options)
+        
+        # Create action mapping (action_idx -> (beaconHz, txPower))
+        self.action_map = []
+        for beacon in self.beacon_options:
+            for txpower in self.txpower_options:
+                self.action_map.append((beacon, txpower))
+        
+        print(f"[DQN] Action space: {self.action_dim} actions")
+        print(f"[DQN] BeaconHz options: {self.beacon_options}")
+        print(f"[DQN] TxPower options: {self.txpower_options}")
         
         # Device setup
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"[DQN] Using device: {self.device}")
         
         # Create policy and target networks
-        self.policy_net = DQNNetwork(state_dim, self.action_dim).to(self.device)
-        self.target_net = DQNNetwork(state_dim, self.action_dim).to(self.device)
+        self.policy_net = DualDQNNetwork(state_dim, self.action_dim).to(self.device)
+        self.target_net = DualDQNNetwork(state_dim, self.action_dim).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.target_net.eval()  # Target network is only used for inference
+        self.target_net.eval()
         
         # Optimizer and loss function
-        self.learning_rate = learning_rate  # Store for later reference
+        self.learning_rate = learning_rate
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=learning_rate)
         self.criterion = nn.MSELoss()
         
@@ -184,34 +160,34 @@ class ContinuousDQNAgent:
         
         # Statistics tracking
         self.total_reward = 0
-        self.recent_rewards = deque(maxlen=100)  # Track last 100 rewards
-        self.recent_losses = deque(maxlen=100)   # Track last 100 losses
+        self.recent_rewards = deque(maxlen=100)
+        self.recent_losses = deque(maxlen=100)
     
     def normalize_state(self, state_dict):
         """
-        Normalize state features to 0-1 range for better neural network performance
+        Normalize state features to 0-1 range
         
-        State features (8 total):
+        State features (9 total):
         1. PDR (Packet Delivery Ratio) - already 0-1
         2. avgNeighbors - normalized by assumed max of 20
         3. beaconHz - normalized by max 20 Hz
-        4. numVehicles - normalized by assumed max of 100
-        5. packetsReceived - normalized by typical max
-        6. packetsSent - normalized by typical max
-        7. throughput - normalized by typical max
-        8. time - normalized by simulation time
-        
-        Note: We removed txPower from state since we don't control it
+        4. txPower - normalized by range 10-30 dBm
+        5. numVehicles - normalized by assumed max of 100
+        6. packetsReceived - normalized by typical max
+        7. packetsSent - normalized by typical max
+        8. throughput - normalized by typical max
+        9. time - normalized by simulation time
         """
         normalized = np.array([
             state_dict.get('PDR', 0.0),                          # 0-1 range
             state_dict.get('avgNeighbors', 0.0) / 20.0,         # 0-1 range
             state_dict.get('beaconHz', 8.0) / 20.0,             # 0-1 range
+            (state_dict.get('txPower', 23.0) - 10.0) / 20.0,    # 0-1 range (10-30 dBm)
             state_dict.get('numVehicles', 10.0) / 100.0,        # 0-1 range
             state_dict.get('packetsReceived', 0.0) / 10000.0,   # 0-1 range
             state_dict.get('packetsSent', 0.0) / 1000.0,        # 0-1 range
             state_dict.get('throughput', 0.0) / 100000.0,       # 0-1 range
-            state_dict.get('time', 0.0) / 200.0,                # 0-1 range (assuming 200s max)
+            state_dict.get('time', 0.0) / 200.0,                # 0-1 range
         ], dtype=np.float32)
         
         return normalized
@@ -220,10 +196,7 @@ class ContinuousDQNAgent:
         """
         Epsilon-greedy action selection
         
-        With probability epsilon: choose random action (EXPLORE)
-        With probability 1-epsilon: choose best action based on Q-values (EXPLOIT)
-        
-        Returns: action_idx (0-5 corresponding to beacon frequencies 2-12 Hz)
+        Returns: action_idx (0-35 corresponding to 36 action combinations)
         """
         if training and random.random() < self.epsilon:
             # EXPLORATION: Random action
@@ -242,9 +215,10 @@ class ContinuousDQNAgent:
         Convert action index to actual parameters
         Returns: dict with beaconHz and txPower
         """
+        beacon, txpower = self.action_map[action_idx]
         return {
-            'beaconHz': self.beacon_options[action_idx],
-            'txPower': self.fixed_tx_power  # Always 23 dBm
+            'beaconHz': beacon,
+            'txPower': txpower
         }
     
     def store_experience(self, state, action_idx, reward, next_state, done):
@@ -255,13 +229,6 @@ class ContinuousDQNAgent:
     def train_step(self):
         """
         Perform one training step using experience replay
-        
-        This is where the actual learning happens:
-        1. Sample random batch from replay buffer
-        2. Compute current Q-values from policy network
-        3. Compute target Q-values using Bellman equation
-        4. Update policy network to minimize difference
-        5. Periodically update target network
         
         Returns: loss value or None if not enough experiences
         """
@@ -282,23 +249,22 @@ class ContinuousDQNAgent:
         # Compute current Q-values: Q(s, a)
         current_q_values = self.policy_net(states).gather(1, actions)
         
-        # Compute target Q-values using Bellman equation:
-        # Q_target(s, a) = reward + γ * max_a' Q_target(s', a')
+        # Compute target Q-values using Bellman equation
         with torch.no_grad():
             next_q_values = self.target_net(next_states).max(1, keepdim=True)[0]
             target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
         
-        # Compute loss (Mean Squared Error)
+        # Compute loss
         loss = self.criterion(current_q_values, target_q_values)
         
         # Optimize the policy network
         self.optimizer.zero_grad()
         loss.backward()
-        # Gradient clipping to prevent exploding gradients
+        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
         self.optimizer.step()
         
-        # Update target network periodically (for stability)
+        # Update target network periodically
         self.step_counter += 1
         if self.step_counter % self.target_update_freq == 0:
             self.target_net.load_state_dict(self.policy_net.state_dict())
@@ -319,6 +285,7 @@ class ContinuousDQNAgent:
             'epsilon': self.epsilon,
             'step_counter': self.step_counter,
             'total_reward': self.total_reward,
+            'action_map': self.action_map,
         }, filepath)
         print(f"[DQN] Model saved to {filepath}")
     
@@ -334,12 +301,12 @@ class ContinuousDQNAgent:
         print(f"[DQN] Model loaded from {filepath}")
 
 
-def run_continuous_dqn(port=5555, train=True, max_steps=1000, 
-                       save_interval=100, model_path=None, use_wandb=False):
+def run_dual_control_dqn(port=5555, train=True, max_steps=1000, 
+                         save_interval=100, model_path=None, use_wandb=False):
     """
-    Run DQN agent in continuous learning mode
+    Run Dual-Control DQN agent in continuous learning mode
     
-    NO EPISODES - just continuous learning!
+    Controls both BeaconHz and TxPower simultaneously
     
     Args:
         port: ZMQ port for communication with NS3
@@ -351,7 +318,7 @@ def run_continuous_dqn(port=5555, train=True, max_steps=1000,
     """
     
     # Create agent
-    agent = ContinuousDQNAgent()
+    agent = DualControlDQNAgent()
     
     # Load existing model if specified
     if model_path and os.path.exists(model_path):
@@ -367,8 +334,8 @@ def run_continuous_dqn(port=5555, train=True, max_steps=1000,
     if use_wandb and WANDB_AVAILABLE and train:
         try:
             wandb_run = wandb.init(
-                project="vanet-dqn-with-ns3",
-                name=f"dqn_continuous_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                project="vanet-dqn-both-txpower-beaconhz",
+                name=f"dqn_dual_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
                 config={
                     "learning_rate": agent.learning_rate,
                     "gamma": agent.gamma,
@@ -378,14 +345,14 @@ def run_continuous_dqn(port=5555, train=True, max_steps=1000,
                     "batch_size": agent.batch_size,
                     "buffer_size": agent.replay_buffer.buffer.maxlen,
                     "target_update_freq": agent.target_update_freq,
-                    "fixed_tx_power": agent.fixed_tx_power,
                     "state_dim": agent.state_dim,
                     "action_dim": agent.action_dim,
                     "beacon_options": agent.beacon_options,
+                    "txpower_options": agent.txpower_options,
                     "max_steps": max_steps,
                     "save_interval": save_interval,
                 },
-                tags=["dqn", "vanet", "beaconhz-only", "continuous-learning"]
+                tags=["dqn", "vanet", "dual-control", "continuous-learning"]
             )
             print("[INFO] WandB logging enabled")
         except Exception as e:
@@ -396,12 +363,14 @@ def run_continuous_dqn(port=5555, train=True, max_steps=1000,
         use_wandb = False
 
     print("\n" + "="*70)
-    print("CONTINUOUS DQN AGENT FOR VANET - BeaconHz Control Only")
+    print("DUAL-CONTROL CONTINUOUS DQN AGENT FOR VANET")
+    print("Controls: BeaconHz + TxPower")
     print("="*70)
     print(f"Mode: {'TRAINING (Learning continuously)' if train else 'EVALUATION (No learning)'}")
     print(f"Port: {port}")
-    print(f"Action Space: {agent.action_dim} actions (BeaconHz: {agent.beacon_options})")
-    print(f"TxPower: FIXED at {agent.fixed_tx_power} dBm")
+    print(f"Action Space: {agent.action_dim} actions (6 BeaconHz × 6 TxPower)")
+    print(f"BeaconHz Options: {agent.beacon_options} Hz")
+    print(f"TxPower Options: {agent.txpower_options} dBm")
     print(f"Max Steps: {'Unlimited' if max_steps == 0 else max_steps}")
     print(f"Current Epsilon: {agent.epsilon:.4f}")
     print(f"Device: {agent.device}")
@@ -427,7 +396,7 @@ def run_continuous_dqn(port=5555, train=True, max_steps=1000,
                 socket.send_string(json.dumps({
                     "action": {
                         "beaconHz": 8, 
-                        "txPower": agent.fixed_tx_power
+                        "txPower": 23
                     }
                 }))
                 continue
@@ -437,7 +406,7 @@ def run_continuous_dqn(port=5555, train=True, max_steps=1000,
             current_state = agent.normalize_state(state_dict)
             
             # Display current status
-            if step % 10 == 0 or step < 5:  # Print every 10 steps or first 5
+            if step % 10 == 0 or step < 5:
                 print(f"\n{'='*70}")
                 print(f"Step {step + 1}")
                 print(f"{'='*70}")
@@ -446,13 +415,16 @@ def run_continuous_dqn(port=5555, train=True, max_steps=1000,
                   f"PDR: {state_dict.get('PDR', 0):.3f} | "
                   f"Neighbors: {state_dict.get('avgNeighbors', 0):.1f} | "
                   f"Throughput: {state_dict.get('throughput', 0):.0f} bps")
+            print(f"[Current] BeaconHz: {state_dict.get('beaconHz', 0):.1f} Hz | "
+                  f"TxPower: {state_dict.get('txPower', 0):.1f} dBm")
             
             # Select action
             action_idx = agent.select_action(current_state, training=train)
             action = agent.get_action_params(action_idx)
             
             print(f"[Action] BeaconHz: {action['beaconHz']} Hz | "
-                  f"TxPower: {action['txPower']} dBm (FIXED)")
+                  f"TxPower: {action['txPower']} dBm | "
+                  f"(Action #{action_idx})")
             if train:
                 print(f"[Learning] Epsilon: {agent.epsilon:.4f} | "
                       f"Buffer: {len(agent.replay_buffer)}/{agent.replay_buffer.buffer.maxlen}")
@@ -473,7 +445,7 @@ def run_continuous_dqn(port=5555, train=True, max_steps=1000,
             agent.recent_rewards.append(reward)
             
             # Learn from experience (if not first step)
-            loss = None  # Initialize loss
+            loss = None
             if prev_state is not None and train:
                 # Store experience
                 agent.store_experience(prev_state, prev_action_idx, reward, 
@@ -497,9 +469,13 @@ def run_continuous_dqn(port=5555, train=True, max_steps=1000,
                     "epsilon": agent.epsilon,
                     "buffer_size": len(agent.replay_buffer),
                     "chosen_beaconHz": action['beaconHz'],
+                    "chosen_txPower": action['txPower'],
+                    "chosen_action_idx": action_idx,
                     "state_pdr": state_dict.get('PDR', 0),
                     "state_avg_neighbors": state_dict.get('avgNeighbors', 0),
                     "state_throughput": state_dict.get('throughput', 0),
+                    "state_beaconHz": state_dict.get('beaconHz', 0),
+                    "state_txPower": state_dict.get('txPower', 0),
                 }
                 if loss is not None:
                     log_data["loss"] = loss
@@ -526,7 +502,7 @@ def run_continuous_dqn(port=5555, train=True, max_steps=1000,
             
             # Save model periodically
             if train and save_interval > 0 and (step + 1) % save_interval == 0:
-                model_file = f"models/dqn_continuous_step{step+1}_{timestamp}.pth"
+                model_file = f"models/dqn_dual_step{step+1}_{timestamp}.pth"
                 agent.save_model(model_file)
             
             # Update for next iteration
@@ -545,7 +521,7 @@ def run_continuous_dqn(port=5555, train=True, max_steps=1000,
     finally:
         # Final save
         if train:
-            final_model = f"models/dqn_continuous_final_{timestamp}.pth"
+            final_model = f"models/dqn_dual_final_{timestamp}.pth"
             agent.save_model(final_model)
         
         # Print final summary
@@ -575,18 +551,21 @@ def run_continuous_dqn(port=5555, train=True, max_steps=1000,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='Continuous DQN Agent for VANET (BeaconHz control only)',
+        description='Dual-Control Continuous DQN Agent for VANET (BeaconHz + TxPower)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Training mode (continuous learning)
-  python dqn_simple_continuous.py --train --max_steps 500
+  # Training mode (continuous learning with dual control)
+  python dqn_dual_continuous.py --train --max_steps 500
   
   # Evaluation mode (no learning, uses learned policy)
-  python dqn_simple_continuous.py --eval --model models/dqn_continuous_final_XXX.pth
+  python dqn_dual_continuous.py --eval --model models/dqn_dual_final_XXX.pth
   
   # Unlimited continuous learning (until Ctrl+C)
-  python dqn_simple_continuous.py --train --max_steps 0
+  python dqn_dual_continuous.py --train --max_steps 0
+  
+  # Training with WandB logging
+  python dqn_dual_continuous.py --train --max_steps 1000 --wandb
         """
     )
     
@@ -610,7 +589,7 @@ Examples:
     # Default to training mode if neither specified
     train_mode = args.train or not args.eval
     
-    run_continuous_dqn(
+    run_dual_control_dqn(
         port=args.port,
         train=train_mode,
         max_steps=args.max_steps,
