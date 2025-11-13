@@ -36,6 +36,9 @@ std::map<uint32_t, uint64_t> g_packetsSent;
 std::map<uint32_t, uint64_t> g_packetsReceived;
 // NEW: Track realistic expected receptions based on neighbors in range
 std::map<uint32_t, uint64_t> g_expectedReceptions;  // How many packets this node SHOULD receive
+// NEW: Track channel busy time for CBR calculation
+std::map<uint32_t, Time> g_channelBusyTime;  // Total time channel is busy per node
+std::map<uint32_t, Time> g_lastChannelSampleTime;  // Last time CBR was sampled
 NodeContainer g_nodes;
 NetDeviceContainer g_devices;
 ApplicationContainer g_onoffApps;  // Store OnOff apps for runtime updates
@@ -44,6 +47,28 @@ Ptr<RLInterface> g_rlInterface;
 // Metrics for reward calculation
 double g_previousPDR = 0.0;
 double g_previousThroughput = 0.0;
+
+// NEW: Track neighbors in range at transmission time
+void UpdateExpectedReceptions(uint32_t senderNodeId) {
+    // When a node sends a packet, count how many nodes are in range
+    // Those nodes SHOULD receive it (realistic denominator for PDR)
+    Ptr<Node> senderNode = g_nodes.Get(senderNodeId);
+    Ptr<MobilityModel> senderMobility = senderNode->GetObject<MobilityModel>();
+    
+    double commRange = 300.0; // Match RangePropagationLossModel MaxRange
+    
+    for (uint32_t i = 0; i < g_nodes.GetN(); i++) {
+        if (i == senderNodeId) continue; // Don't count sender
+        
+        Ptr<MobilityModel> receiverMobility = g_nodes.Get(i)->GetObject<MobilityModel>();
+        double distance = senderMobility->GetDistanceFrom(receiverMobility);
+        
+        if (distance <= commRange) {
+            // This node is in range, so it SHOULD receive this packet
+            g_expectedReceptions[i]++;
+        }
+    }
+}
 
 // Packet sent callback
 void TxCallback(std::string context, Ptr<const Packet> packet) {
@@ -55,6 +80,8 @@ void TxCallback(std::string context, Ptr<const Packet> packet) {
         if (end != std::string::npos) {
             uint32_t nodeId = std::stoul(context.substr(start, end - start));
             g_packetsSent[nodeId]++;
+            // NEW: Update expected receptions for all nodes in range
+            UpdateExpectedReceptions(nodeId);
         }
     }
 }
@@ -96,12 +123,67 @@ double GetAvgInterVehicleDistance(Ptr<Node> node) {
         if (g_nodes.Get(i)->GetId() == node->GetId()) continue;
         Ptr<MobilityModel> otherMobility = g_nodes.Get(i)->GetObject<MobilityModel>();
         double distance = mobility->GetDistanceFrom(otherMobility);
-        if (distance <= 500.0) {
+        if (distance <= 300.0) {  // FIX: Match communication range (was 500.0)
             totalDistance += distance;
             count++;
         }
     }
     return count > 0 ? totalDistance / count : 0.0;
+}
+
+// NEW: Calculate Channel Busy Ratio (CBR) for a node
+double CalculateCBR(Ptr<Node> node) {
+    uint32_t nodeId = node->GetId();
+    Ptr<NetDevice> device = node->GetDevice(0);
+    Ptr<WifiNetDevice> wifiDevice = DynamicCast<WifiNetDevice>(device);
+    
+    if (!wifiDevice) {
+        return 0.0;
+    }
+    
+    Ptr<WifiPhy> wifiPhy = wifiDevice->GetPhy();
+    if (!wifiPhy) {
+        return 0.0;
+    }
+    
+    // Get current time
+    Time currentTime = Simulator::Now();
+    
+    // Get time since last sample
+    Time timeSinceLastSample = currentTime - g_lastChannelSampleTime[nodeId];
+    
+    if (timeSinceLastSample.GetSeconds() == 0.0) {
+        return 0.0;
+    }
+    
+    // In NS-3, we can estimate CBR by tracking PHY state
+    // CBR = (time in TX + time in RX + time in CCA_BUSY) / total_time
+    // For simplicity, we'll estimate based on packet activity
+    
+    // Alternative: Use channel activity metrics
+    // Here we use a simplified approach based on transmission activity
+    Time busyTime = wifiPhy->GetDelayUntilIdle();
+    
+    // Update last sample time
+    g_lastChannelSampleTime[nodeId] = currentTime;
+    
+    // Return CBR (0.0 to 1.0)
+    return std::min(1.0, busyTime.GetSeconds());
+}
+
+// NEW: Get average CBR across all nodes
+double GetAverageCBR() {
+    double totalCBR = 0.0;
+    uint32_t nodeCount = 0;
+    
+    for (uint32_t i = 0; i < g_nodes.GetN(); i++) {
+        Ptr<Node> node = g_nodes.Get(i);
+        double cbr = CalculateCBR(node);
+        totalCBR += cbr;
+        nodeCount++;
+    }
+    
+    return (nodeCount > 0) ? totalCBR / nodeCount : 0.0;
 }
 
 // Forward declarations
@@ -189,6 +271,7 @@ void LogMetrics() {
     std::cout << "========================================" << std::endl;
     
     uint64_t totalSent = 0, totalRecv = 0;
+    uint64_t totalExpectedRecv = 0; // NEW: realistic expected receptions
     
     // Only log first 10 nodes to reduce output with large SUMO traces
     uint32_t nodesToLog = std::min((uint32_t)10, g_nodes.GetN());
@@ -199,14 +282,9 @@ void LogMetrics() {
         
         uint64_t sent = g_packetsSent[nodeId];
         uint64_t recv = g_packetsReceived[nodeId];
+        uint64_t expectedRecv = g_expectedReceptions[nodeId]; // NEW: realistic expectation
         
-        // Calculate PDR for this node
-        uint64_t expectedRecv = 0;
-        for (uint32_t j = 0; j < g_nodes.GetN(); j++) {
-            if (i != j) {
-                expectedRecv += g_packetsSent[j];
-            }
-        }
+        // NEW: PDR based on realistic expected receptions (only from nodes in range)
         double nodePDR = (expectedRecv > 0) ? (double)recv / expectedRecv : 0.0;
         
         double throughput = (recv * 200 * 8) / currentTime;
@@ -221,6 +299,7 @@ void LogMetrics() {
         std::cout << "Node[" << std::setw(2) << nodeId << "]"
                   << " Sent:" << std::setw(5) << sent
                   << " Recv:" << std::setw(5) << recv
+                  << " Exp:" << std::setw(5) << expectedRecv  // NEW: show expected
                   << " PDR:" << std::fixed << std::setprecision(3) << std::setw(6) << nodePDR
                   << " Tput:" << std::setw(8) << (int)throughput << "bps"
                   << " | Pos(" << std::setw(6) << (int)pos.x << "," << std::setw(6) << (int)pos.y << ")"
@@ -238,10 +317,10 @@ void LogMetrics() {
     for (uint32_t i = 0; i < g_nodes.GetN(); i++) {
         totalSent += g_packetsSent[i];
         totalRecv += g_packetsReceived[i];
+        totalExpectedRecv += g_expectedReceptions[i];  // NEW
     }
     
-    // Global PDR: total received vs total that should have been received
-    uint64_t totalExpectedRecv = totalSent * (g_nodes.GetN() - 1);
+    // NEW: Global PDR using realistic expected receptions
     double globalPDR = (totalExpectedRecv > 0) ? (double)totalRecv / totalExpectedRecv : 0.0;
     
     // Calculate average metrics
@@ -257,10 +336,15 @@ void LogMetrics() {
     avgThroughput /= g_nodes.GetN();
     avgNeighbors /= g_nodes.GetN();
     
+    // NEW: Calculate average Channel Busy Ratio
+    double avgCBR = GetAverageCBR();
+    
     std::cout << "========================================" << std::endl;
     std::cout << "TOTAL Sent:" << totalSent << " Recv:" << totalRecv 
+              << " Expected:" << totalExpectedRecv  // NEW: show total expected
               << " GlobalPDR:" << std::fixed << std::setprecision(3) << globalPDR 
-              << " AvgNeighbors:" << std::setprecision(1) << avgNeighbors << std::endl;
+              << " AvgNeighbors:" << std::setprecision(1) << avgNeighbors 
+              << " CBR:" << std::setprecision(3) << avgCBR << std::endl;  // NEW: show CBR
     std::cout << std::endl;
     
     // RL Agent Interaction
@@ -276,6 +360,7 @@ void LogMetrics() {
         state["beaconHz"] = 1.0 / g_beaconInterval;
         state["txPower"] = g_txPower;
         state["numVehicles"] = g_nodes.GetN();
+        state["CBR"] = avgCBR;  // NEW: Add Channel Busy Ratio
         
         // Send state to RL agent
         g_rlInterface->SendState(state);
@@ -504,6 +589,8 @@ int main(int argc, char *argv[]) {
         g_packetsSent[i] = 0;
         g_packetsReceived[i] = 0;
         g_expectedReceptions[i] = 0;  // NEW: initialize expected receptions
+        g_channelBusyTime[i] = Seconds(0.0);  // NEW: initialize CBR tracking
+        g_lastChannelSampleTime[i] = Seconds(0.0);  // NEW: initialize CBR tracking
     }
     
     // Schedule logging

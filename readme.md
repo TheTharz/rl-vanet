@@ -14,18 +14,31 @@ python -u dqn_simple_continuous.py --train --max_steps 0 --save_interval 100 > t
 
 python dqn_simple_continuous.py --train --max_steps 500 --wandb
 
+python dqn_dual_continuous.py --train --max_steps 0 --wandb
+python ppo_dual_continuous.py --train --max_steps 0 --wandb
 run the vanet
 
-./build/scratch/v2x/scratch_v2x_v2x --vehicles=100 --simTime=7200 --logInterval=5.0 --beaconHz=2.0 --enableRL=1
+./build/scratch/v2x/scratch_v2x_v2x --vehicles=60 --simTime=7200 --logInterval=5.0 --beaconHz=8.0 --enableRL=1
 
 wandb api key - 
 
 running the vanet sumo
 ./build/scratch/v2x_sumo/scratch_v2x_sumo_vanet \
   --simTime=36000 \
-  --logInterval=5.0 \
+  --logInterval=5.0 \ 
   --beaconHz=2.0 \
   --enableRL=1
 
 running the updated vanet with the new pdr calculation
 
+python baseline.py \
+  --project "vanet-ppo-dual-control" \
+  --name "baseline_60vehicles_8hz_23dbm"
+
+python baseline.py \
+  --project "vanet-dqn-both-txpower-beaconhz" \
+  --name "baseline_30vehicles_8hz_23dbm"
+  
+python test_model.py --model models/ppo_dual_final_20251112_054517.pth --wandb --wandb_project vanet-ppo-dual-control
+
+python test_baseline.py --beaconHz 8 --txPower 23 --wandb --wandb_project "vanet-ppo-dual-control" --max_steps 1000

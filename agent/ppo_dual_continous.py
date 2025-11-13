@@ -1,22 +1,21 @@
 """
-Dual-Control Continuous DQN Agent for VANET - BeaconHz + TxPower
+Dual-Control Continuous PPO Agent for VANET - BeaconHz + TxPower
 ===================================================================
 
-This agent controls BOTH:
-1. BeaconHz (beacon frequency): 2-12 Hz
+This agent uses Proximal Policy Optimization (PPO) to control BOTH:
+1. BeaconHz (beacon frequency): 4-12 Hz (constrained to optimal range)
 2. TxPower (transmission power): 15-30 dBm
 
 ACTION SPACE:
-- BeaconHz options: [2, 4, 6, 8, 10, 12] Hz (6 options)
+- BeaconHz options: [4, 6, 8, 10, 12] Hz (5 options)
 - TxPower options: [15, 18, 21, 23, 26, 30] dBm (6 options)
-- Total actions: 6 × 6 = 36 discrete actions
-
-Each action combines one BeaconHz with one TxPower setting.
+- Total actions: 5 × 6 = 30 discrete actions
 
 LEARNING APPROACH:
 - Continuous learning (no episodes)
-- DQN with experience replay
-- Epsilon-greedy exploration
+- PPO with Actor-Critic architecture
+- Experience collection and batch updates
+- On-policy learning with advantage estimation
 - Dual target: optimize both communication frequency and transmission power
 """
 
@@ -26,11 +25,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import random
-from collections import deque, namedtuple
+from torch.distributions import Categorical
 import argparse
 import os
 from datetime import datetime
+from collections import deque
 
 # Optional WandB integration
 try:
@@ -40,94 +39,142 @@ except ImportError:
     WANDB_AVAILABLE = False
     print("[WARNING] WandB not installed. Run 'pip install wandb' for experiment tracking.")
 
-# Experience tuple for replay buffer
-Experience = namedtuple('Experience', ['state', 'action', 'reward', 'next_state', 'done'])
 
-
-class DualDQNNetwork(nn.Module):
+class ActorCriticNetwork(nn.Module):
     """
-    Deep Q-Network for dual control (BeaconHz + TxPower)
-    Input: 9 state features (including both beaconHz and txPower)
-    Output: 36 Q-values (6 beaconHz × 6 txPower options)
+    Actor-Critic Network for PPO
+    - Actor: Outputs action probability distribution (policy)
+    - Critic: Outputs state value estimate
     """
     
-    def __init__(self, state_dim=9, action_dim=36, hidden_size=128):
-        super(DualDQNNetwork, self).__init__()
+    def __init__(self, state_dim=10, action_dim=30, hidden_size=512):
+        super(ActorCriticNetwork, self).__init__()
         
-        # Larger network for more complex action space
-        self.network = nn.Sequential(
+        # Shared feature extraction layers
+        self.shared = nn.Sequential(
             nn.Linear(state_dim, hidden_size),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
             nn.Dropout(0.2),
+        )
+        
+        # Actor head (policy) - outputs action probabilities
+        self.actor = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
-            nn.Linear(hidden_size // 2, action_dim)
+            nn.Linear(hidden_size // 2, action_dim),
+        )
+        
+        # Critic head (value function) - outputs state value
+        self.critic = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 1)
         )
     
     def forward(self, x):
-        return self.network(x)
+        """Forward pass through network"""
+        shared_features = self.shared(x)
+        action_logits = self.actor(shared_features)
+        state_value = self.critic(shared_features)
+        return action_logits, state_value
+    
+    def act(self, state):
+        """
+        Select action based on current policy
+        Returns: action, log_prob, state_value
+        """
+        action_logits, state_value = self.forward(state)
+        action_probs = torch.softmax(action_logits, dim=-1)
+        dist = Categorical(action_probs)
+        action = dist.sample()
+        action_logprob = dist.log_prob(action)
+        return action.item(), action_logprob, state_value
+    
+    def evaluate(self, states, actions):
+        """
+        Evaluate actions for PPO update
+        Returns: log_probs, state_values, entropy
+        """
+        action_logits, state_values = self.forward(states)
+        action_probs = torch.softmax(action_logits, dim=-1)
+        dist = Categorical(action_probs)
+        action_logprobs = dist.log_prob(actions)
+        dist_entropy = dist.entropy()
+        return action_logprobs, state_values, dist_entropy
 
 
-class ReplayBuffer:
+class PPOMemory:
     """
-    Experience Replay Buffer
-    Stores past experiences and samples random batches for training
+    Memory buffer for storing experiences before PPO update
     """
     
-    def __init__(self, capacity=10000):
-        self.buffer = deque(maxlen=capacity)
+    def __init__(self):
+        self.states = []
+        self.actions = []
+        self.logprobs = []
+        self.rewards = []
+        self.state_values = []
+        self.is_terminals = []
     
-    def push(self, experience):
-        """Add new experience to buffer"""
-        self.buffer.append(experience)
+    def push(self, state, action, logprob, reward, state_value, done):
+        """Add experience to memory"""
+        self.states.append(state)
+        self.actions.append(action)
+        self.logprobs.append(logprob)
+        self.rewards.append(reward)
+        self.state_values.append(state_value)
+        self.is_terminals.append(done)
     
-    def sample(self, batch_size):
-        """Sample random batch of experiences"""
-        return random.sample(self.buffer, batch_size)
+    def clear(self):
+        """Clear all stored experiences"""
+        del self.states[:]
+        del self.actions[:]
+        del self.logprobs[:]
+        del self.rewards[:]
+        del self.state_values[:]
+        del self.is_terminals[:]
     
     def __len__(self):
-        return len(self.buffer)
+        return len(self.states)
 
 
-class DualControlDQNAgent:
+class DualControlPPOAgent:
     """
-    Continuous Learning DQN Agent for VANET with Dual Control
+    Continuous Learning PPO Agent for VANET with Dual Control
     
     Controls both:
     - BeaconHz: Communication frequency (2-12 Hz)
     - TxPower: Transmission power (15-30 dBm)
     """
     
-    def __init__(self, 
-                 state_dim=10,          # 10 state features (added CBR)
+    def __init__(self,
+                 state_dim=10,           # 10 state features (including CBR)
                  learning_rate=0.0003,   # Learning rate
-                 gamma=0.99,            # Discount factor
-                 epsilon_start=1.0,     # Initial exploration rate
-                 epsilon_end=0.05,      # Minimum exploration rate
-                 epsilon_decay=0.9995,  # Decay rate per step (slower for larger action space)
-                 buffer_size=20000,     # Larger buffer for dual control
-                 batch_size=64,         # Training batch size
-                 target_update_freq=250): # Update target network frequency
+                 gamma=0.90,             # Discount factor
+                 eps_clip=0.2,           # PPO clip parameter
+                 K_epochs=20,             # Number of PPO epochs per update
+                 entropy_coef=0.03,      # Entropy coefficient for exploration
+                 value_coef=0.5,         # Value loss coefficient
+                 update_timesteps=512):  # Update policy every N timesteps
         
         self.state_dim = state_dim
         self.gamma = gamma
-        self.epsilon = epsilon_start
-        self.epsilon_end = epsilon_end
-        self.epsilon_decay = epsilon_decay
-        self.batch_size = batch_size
-        self.target_update_freq = target_update_freq
-        self.step_counter = 0
+        self.eps_clip = eps_clip
+        self.K_epochs = K_epochs
+        self.entropy_coef = entropy_coef
+        self.value_coef = value_coef
+        self.update_timesteps = update_timesteps
         
         # DUAL ACTION SPACE
-        # BeaconHz options: 6 choices
-        self.beacon_options = [2, 4, 6, 8, 10, 12]
+        # BeaconHz options: Constrained to optimal range 4-12 Hz
+        self.beacon_options = [4, 6, 8, 10, 12]
         # TxPower options: 6 choices
         self.txpower_options = [15, 18, 21, 23, 26, 30]
         
-        # Total action space: 6 × 6 = 36 actions
+        # Total action space: 5 × 6 = 30 actions
         self.action_dim = len(self.beacon_options) * len(self.txpower_options)
         
         # Create action mapping (action_idx -> (beaconHz, txPower))
@@ -136,32 +183,37 @@ class DualControlDQNAgent:
             for txpower in self.txpower_options:
                 self.action_map.append((beacon, txpower))
         
-        print(f"[DQN] Action space: {self.action_dim} actions")
-        print(f"[DQN] BeaconHz options: {self.beacon_options}")
-        print(f"[DQN] TxPower options: {self.txpower_options}")
+        print(f"[PPO] Action space: {self.action_dim} actions")
+        print(f"[PPO] BeaconHz options: {self.beacon_options}")
+        print(f"[PPO] TxPower options: {self.txpower_options}")
         
         # Device setup
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"[DQN] Using device: {self.device}")
+        print(f"[PPO] Using device: {self.device}")
         
-        # Create policy and target networks
-        self.policy_net = DualDQNNetwork(state_dim, self.action_dim).to(self.device)
-        self.target_net = DualDQNNetwork(state_dim, self.action_dim).to(self.device)
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.target_net.eval()
+        # Create policy network (current policy)
+        self.policy = ActorCriticNetwork(state_dim, self.action_dim).to(self.device)
         
-        # Optimizer and loss function
+        # Create old policy network (for PPO ratio calculation)
+        self.policy_old = ActorCriticNetwork(state_dim, self.action_dim).to(self.device)
+        self.policy_old.load_state_dict(self.policy.state_dict())
+        
+        # Optimizer
         self.learning_rate = learning_rate
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=learning_rate)
-        self.criterion = nn.MSELoss()
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
         
-        # Experience replay buffer
-        self.replay_buffer = ReplayBuffer(buffer_size)
+        # Loss function for critic
+        self.MseLoss = nn.MSELoss()
+        
+        # Memory for collecting experiences
+        self.memory = PPOMemory()
         
         # Statistics tracking
         self.total_reward = 0
         self.recent_rewards = deque(maxlen=100)
         self.recent_losses = deque(maxlen=100)
+        self.step_counter = 0
+        self.update_counter = 0
     
     def normalize_state(self, state_dict):
         """
@@ -196,21 +248,23 @@ class DualControlDQNAgent:
     
     def select_action(self, state, training=True):
         """
-        Epsilon-greedy action selection
+        Select action using policy network
         
-        Returns: action_idx (0-35 corresponding to 36 action combinations)
+        Returns: action_idx, log_prob, state_value
         """
-        if training and random.random() < self.epsilon:
-            # EXPLORATION: Random action
-            action_idx = random.randrange(self.action_dim)
-        else:
-            # EXPLOITATION: Best action according to policy network
-            with torch.no_grad():
-                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-                q_values = self.policy_net(state_tensor)
-                action_idx = q_values.argmax().item()
-        
-        return action_idx
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            
+            if training:
+                # Sample action from policy (stochastic)
+                action_idx, action_logprob, state_value = self.policy_old.act(state_tensor)
+                return action_idx, action_logprob, state_value
+            else:
+                # Greedy action selection (deterministic)
+                action_logits, _ = self.policy(state_tensor)
+                action_probs = torch.softmax(action_logits, dim=-1)
+                action_idx = action_probs.argmax().item()
+                return action_idx, None, None
     
     def get_action_params(self, action_idx):
         """
@@ -223,90 +277,115 @@ class DualControlDQNAgent:
             'txPower': txpower
         }
     
-    def store_experience(self, state, action_idx, reward, next_state, done):
-        """Store experience in replay buffer"""
-        experience = Experience(state, action_idx, reward, next_state, done)
-        self.replay_buffer.push(experience)
+    def store_experience(self, state, action_idx, logprob, reward, state_value, done):
+        """Store experience in memory"""
+        self.memory.push(state, action_idx, logprob, reward, state_value, done)
     
-    def train_step(self):
+    def update(self):
         """
-        Perform one training step using experience replay
+        PPO update using collected experiences
         
-        Returns: loss value or None if not enough experiences
+        Returns: average loss or None if not enough experiences
         """
-        # Need enough experiences before we can train
-        if len(self.replay_buffer) < self.batch_size:
+        if len(self.memory) == 0:
             return None
         
-        # Sample random batch of experiences
-        experiences = self.replay_buffer.sample(self.batch_size)
+        # Monte Carlo estimate of returns (discounted rewards)
+        rewards = []
+        discounted_reward = 0
+        for reward, is_terminal in zip(reversed(self.memory.rewards), 
+                                       reversed(self.memory.is_terminals)):
+            if is_terminal:
+                discounted_reward = 0
+            discounted_reward = reward + (self.gamma * discounted_reward)
+            rewards.insert(0, discounted_reward)
         
-        # Unpack batch into separate tensors
-        states = torch.FloatTensor([e.state for e in experiences]).to(self.device)
-        actions = torch.LongTensor([e.action for e in experiences]).unsqueeze(1).to(self.device)
-        rewards = torch.FloatTensor([e.reward for e in experiences]).unsqueeze(1).to(self.device)
-        next_states = torch.FloatTensor([e.next_state for e in experiences]).to(self.device)
-        dones = torch.FloatTensor([e.done for e in experiences]).unsqueeze(1).to(self.device)
+        # Convert rewards to tensor
+        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
         
-        # Compute current Q-values: Q(s, a)
-        current_q_values = self.policy_net(states).gather(1, actions)
+        # Normalize rewards for stability
+        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
         
-        # Compute target Q-values using Bellman equation
-        with torch.no_grad():
-            next_q_values = self.target_net(next_states).max(1, keepdim=True)[0]
-            target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
+        # Convert experiences to tensors
+        old_states = torch.FloatTensor(np.array(self.memory.states)).to(self.device)
+        old_actions = torch.LongTensor(self.memory.actions).to(self.device)
+        old_logprobs = torch.stack(self.memory.logprobs).detach().to(self.device)
+        old_state_values = torch.stack(self.memory.state_values).squeeze().detach().to(self.device)
         
-        # Compute loss
-        loss = self.criterion(current_q_values, target_q_values)
+        # Calculate advantages: A(s,a) = Q(s,a) - V(s) = R - V(s)
+        advantages = rewards - old_state_values
         
-        # Optimize the policy network
-        self.optimizer.zero_grad()
-        loss.backward()
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
-        self.optimizer.step()
+        # Optimize policy for K epochs
+        total_loss = 0
+        for epoch in range(self.K_epochs):
+            # Evaluate old actions with current policy
+            logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
+            state_values = state_values.squeeze()
+            
+            # Calculate importance sampling ratio: π_θ(a|s) / π_θ_old(a|s)
+            ratios = torch.exp(logprobs - old_logprobs)
+            
+            # Clipped surrogate loss (PPO's key innovation)
+            surr1 = ratios * advantages
+            surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+            
+            # Final loss components
+            actor_loss = -torch.min(surr1, surr2).mean()              # Policy loss (clipped)
+            critic_loss = self.MseLoss(state_values, rewards)         # Value function loss
+            entropy_loss = -dist_entropy.mean()                       # Entropy bonus (exploration)
+            
+            # Total loss
+            loss = actor_loss + self.value_coef * critic_loss + self.entropy_coef * entropy_loss
+            
+            # Gradient descent step
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+            self.optimizer.step()
+            
+            total_loss += loss.item()
         
-        # Update target network periodically
-        self.step_counter += 1
-        if self.step_counter % self.target_update_freq == 0:
-            self.target_net.load_state_dict(self.policy_net.state_dict())
-            print(f"[DQN] Target network updated at step {self.step_counter}")
+        avg_loss = total_loss / self.K_epochs
         
-        return loss.item()
-    
-    def decay_epsilon(self):
-        """Gradually decrease exploration rate"""
-        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
+        # Copy new weights to old policy
+        self.policy_old.load_state_dict(self.policy.state_dict())
+        
+        # Clear memory
+        self.memory.clear()
+        
+        self.update_counter += 1
+        
+        return avg_loss
     
     def save_model(self, filepath):
         """Save model checkpoint"""
         torch.save({
-            'policy_net_state_dict': self.policy_net.state_dict(),
-            'target_net_state_dict': self.target_net.state_dict(),
+            'policy_state_dict': self.policy.state_dict(),
+            'policy_old_state_dict': self.policy_old.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'epsilon': self.epsilon,
             'step_counter': self.step_counter,
+            'update_counter': self.update_counter,
             'total_reward': self.total_reward,
             'action_map': self.action_map,
         }, filepath)
-        print(f"[DQN] Model saved to {filepath}")
+        print(f"[PPO] Model saved to {filepath}")
     
     def load_model(self, filepath):
         """Load model checkpoint"""
         checkpoint = torch.load(filepath, map_location=self.device)
-        self.policy_net.load_state_dict(checkpoint['policy_net_state_dict'])
-        self.target_net.load_state_dict(checkpoint['target_net_state_dict'])
+        self.policy.load_state_dict(checkpoint['policy_state_dict'])
+        self.policy_old.load_state_dict(checkpoint['policy_old_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.epsilon = checkpoint.get('epsilon', self.epsilon)
         self.step_counter = checkpoint.get('step_counter', 0)
+        self.update_counter = checkpoint.get('update_counter', 0)
         self.total_reward = checkpoint.get('total_reward', 0)
-        print(f"[DQN] Model loaded from {filepath}")
+        print(f"[PPO] Model loaded from {filepath}")
 
 
-def run_dual_control_dqn(port=5555, train=True, max_steps=1000, 
+def run_dual_control_ppo(port=5555, train=True, max_steps=1000,
                          save_interval=100, model_path=None, use_wandb=False):
     """
-    Run Dual-Control DQN agent in continuous learning mode
+    Run Dual-Control PPO agent in continuous learning mode
     
     Controls both BeaconHz and TxPower simultaneously
     
@@ -320,7 +399,7 @@ def run_dual_control_dqn(port=5555, train=True, max_steps=1000,
     """
     
     # Create agent
-    agent = DualControlDQNAgent()
+    agent = DualControlPPOAgent()
     
     # Load existing model if specified
     if model_path and os.path.exists(model_path):
@@ -336,17 +415,16 @@ def run_dual_control_dqn(port=5555, train=True, max_steps=1000,
     if use_wandb and WANDB_AVAILABLE and train:
         try:
             wandb_run = wandb.init(
-                project="vanet-dqn-both-txpower-beaconhz",
-                name=f"dqn_dual_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                project="vanet-ppo-dual-control",
+                name=f"ppo_dual_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
                 config={
                     "learning_rate": agent.learning_rate,
                     "gamma": agent.gamma,
-                    "epsilon_start": agent.epsilon,
-                    "epsilon_end": agent.epsilon_end,
-                    "epsilon_decay": agent.epsilon_decay,
-                    "batch_size": agent.batch_size,
-                    "buffer_size": agent.replay_buffer.buffer.maxlen,
-                    "target_update_freq": agent.target_update_freq,
+                    "eps_clip": agent.eps_clip,
+                    "K_epochs": agent.K_epochs,
+                    "entropy_coef": agent.entropy_coef,
+                    "value_coef": agent.value_coef,
+                    "update_timesteps": agent.update_timesteps,
                     "state_dim": agent.state_dim,
                     "action_dim": agent.action_dim,
                     "beacon_options": agent.beacon_options,
@@ -354,7 +432,7 @@ def run_dual_control_dqn(port=5555, train=True, max_steps=1000,
                     "max_steps": max_steps,
                     "save_interval": save_interval,
                 },
-                tags=["dqn", "vanet", "dual-control", "continuous-learning"]
+                tags=["ppo", "vanet", "dual-control", "continuous-learning"]
             )
             print("[INFO] WandB logging enabled")
         except Exception as e:
@@ -363,9 +441,9 @@ def run_dual_control_dqn(port=5555, train=True, max_steps=1000,
     elif use_wandb and not WANDB_AVAILABLE:
         print("[WARNING] WandB requested but not installed. Run: pip install wandb")
         use_wandb = False
-
+    
     print("\n" + "="*70)
-    print("DUAL-CONTROL CONTINUOUS DQN AGENT FOR VANET")
+    print("DUAL-CONTROL CONTINUOUS PPO AGENT FOR VANET")
     print("Controls: BeaconHz + TxPower")
     print("="*70)
     print(f"Mode: {'TRAINING (Learning continuously)' if train else 'EVALUATION (No learning)'}")
@@ -374,14 +452,12 @@ def run_dual_control_dqn(port=5555, train=True, max_steps=1000,
     print(f"BeaconHz Options: {agent.beacon_options} Hz")
     print(f"TxPower Options: {agent.txpower_options} dBm")
     print(f"Max Steps: {'Unlimited' if max_steps == 0 else max_steps}")
-    print(f"Current Epsilon: {agent.epsilon:.4f}")
+    print(f"Update Interval: {agent.update_timesteps} timesteps")
     print(f"Device: {agent.device}")
     print("="*70)
     print("\nWaiting for NS3 simulation to connect...\n")
     
     step = 0
-    prev_state = None
-    prev_action_idx = None
     
     # Create models directory
     os.makedirs("models", exist_ok=True)
@@ -397,7 +473,7 @@ def run_dual_control_dqn(port=5555, train=True, max_steps=1000,
             if data.get('type') != 'state':
                 socket.send_string(json.dumps({
                     "action": {
-                        "beaconHz": 8, 
+                        "beaconHz": 8,
                         "txPower": 23
                     }
                 }))
@@ -422,15 +498,15 @@ def run_dual_control_dqn(port=5555, train=True, max_steps=1000,
                   f"TxPower: {state_dict.get('txPower', 0):.1f} dBm")
             
             # Select action
-            action_idx = agent.select_action(current_state, training=train)
+            action_idx, action_logprob, state_value = agent.select_action(current_state, training=train)
             action = agent.get_action_params(action_idx)
             
             print(f"[Action] BeaconHz: {action['beaconHz']} Hz | "
                   f"TxPower: {action['txPower']} dBm | "
                   f"(Action #{action_idx})")
             if train:
-                print(f"[Learning] Epsilon: {agent.epsilon:.4f} | "
-                      f"Buffer: {len(agent.replay_buffer)}/{agent.replay_buffer.buffer.maxlen}")
+                print(f"[Learning] Memory: {len(agent.memory)}/{agent.update_timesteps} | "
+                      f"Updates: {agent.update_counter}")
             
             # Send action to NS3
             socket.send_string(json.dumps({"action": action}))
@@ -447,21 +523,18 @@ def run_dual_control_dqn(port=5555, train=True, max_steps=1000,
             agent.total_reward += reward
             agent.recent_rewards.append(reward)
             
-            # Learn from experience (if not first step)
+            # Store experience in memory
+            if train:
+                agent.store_experience(current_state, action_idx, action_logprob, 
+                                      reward, state_value, done)
+            
+            # Perform PPO update when enough experiences collected
             loss = None
-            if prev_state is not None and train:
-                # Store experience
-                agent.store_experience(prev_state, prev_action_idx, reward, 
-                                      current_state, done)
-                
-                # Train on batch
-                loss = agent.train_step()
+            if train and len(agent.memory) >= agent.update_timesteps:
+                loss = agent.update()
                 if loss is not None:
                     agent.recent_losses.append(loss)
-                    print(f"[Training] Loss: {loss:.4f}")
-                
-                # Decay exploration rate
-                agent.decay_epsilon()
+                    print(f"[Training] PPO Update #{agent.update_counter} | Loss: {loss:.4f}")
             
             # Log to WandB if enabled
             if use_wandb and wandb_run:
@@ -469,8 +542,8 @@ def run_dual_control_dqn(port=5555, train=True, max_steps=1000,
                     "step": step,
                     "reward": reward,
                     "total_reward": agent.total_reward,
-                    "epsilon": agent.epsilon,
-                    "buffer_size": len(agent.replay_buffer),
+                    "memory_size": len(agent.memory),
+                    "updates": agent.update_counter,
                     "chosen_beaconHz": action['beaconHz'],
                     "chosen_txPower": action['txPower'],
                     "chosen_action_idx": action_idx,
@@ -479,13 +552,13 @@ def run_dual_control_dqn(port=5555, train=True, max_steps=1000,
                     "state_throughput": state_dict.get('throughput', 0),
                     "state_beaconHz": state_dict.get('beaconHz', 0),
                     "state_txPower": state_dict.get('txPower', 0),
-                    "state_cbr": state_dict.get('CBR', 0),  # NEW: log CBR
+                    "state_cbr": state_dict.get('CBR', 0),
                 }
                 if loss is not None:
                     log_data["loss"] = loss
                 
                 wandb.log(log_data)
-
+            
             # Print summary statistics periodically
             if step > 0 and step % 50 == 0:
                 avg_reward = np.mean(agent.recent_rewards) if agent.recent_rewards else 0
@@ -498,7 +571,7 @@ def run_dual_control_dqn(port=5555, train=True, max_steps=1000,
                 print(f"Avg Recent Reward: {avg_reward:.3f}")
                 if train and agent.recent_losses:
                     print(f"Avg Recent Loss: {avg_loss:.4f}")
-                print(f"Exploration Rate (Epsilon): {agent.epsilon:.4f}")
+                print(f"PPO Updates: {agent.update_counter}")
                 print(f"{'*'*70}\n")
             
             # Send acknowledgment
@@ -506,17 +579,20 @@ def run_dual_control_dqn(port=5555, train=True, max_steps=1000,
             
             # Save model periodically
             if train and save_interval > 0 and (step + 1) % save_interval == 0:
-                model_file = f"models/dqn_dual_step{step+1}_{timestamp}.pth"
+                model_file = f"models/ppo_dual_step{step+1}_{timestamp}.pth"
                 agent.save_model(model_file)
             
-            # Update for next iteration
-            prev_state = current_state
-            prev_action_idx = action_idx
             step += 1
+            agent.step_counter = step
             
             # Check if simulation ended
             if done:
                 print("\n[INFO] Simulation ended (done=True received)")
+                # Do final update if there are experiences in memory
+                if train and len(agent.memory) > 0:
+                    loss = agent.update()
+                    if loss is not None:
+                        print(f"[Training] Final PPO Update | Loss: {loss:.4f}")
                 break
     
     except KeyboardInterrupt:
@@ -525,7 +601,7 @@ def run_dual_control_dqn(port=5555, train=True, max_steps=1000,
     finally:
         # Final save
         if train:
-            final_model = f"models/dqn_dual_final_{timestamp}.pth"
+            final_model = f"models/ppo_dual_final_{timestamp}.pth"
             agent.save_model(final_model)
         
         # Print final summary
@@ -540,8 +616,8 @@ def run_dual_control_dqn(port=5555, train=True, max_steps=1000,
             print(f"Min Recent Reward: {np.min(agent.recent_rewards):.3f}")
         if train and agent.recent_losses:
             print(f"Average Recent Loss (last 100): {np.mean(agent.recent_losses):.4f}")
-        print(f"Final Epsilon: {agent.epsilon:.4f}")
-        print(f"Replay Buffer Size: {len(agent.replay_buffer)}")
+        print(f"Total PPO Updates: {agent.update_counter}")
+        print(f"Final Memory Size: {len(agent.memory)}")
         print("="*70)
         
         # Close WandB if it was initialized
@@ -555,45 +631,51 @@ def run_dual_control_dqn(port=5555, train=True, max_steps=1000,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='Dual-Control Continuous DQN Agent for VANET (BeaconHz + TxPower)',
+        description='Dual-Control Continuous PPO Agent for VANET (BeaconHz + TxPower)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Training mode (continuous learning with dual control)
-  python dqn_dual_continuous.py --train --max_steps 500
+  python ppo_dual_continuous.py --train --max_steps 500
   
   # Evaluation mode (no learning, uses learned policy)
-  python dqn_dual_continuous.py --eval --model models/dqn_dual_final_XXX.pth
+  python ppo_dual_continuous.py --eval --model models/ppo_dual_final_XXX.pth
   
   # Unlimited continuous learning (until Ctrl+C)
-  python dqn_dual_continuous.py --train --max_steps 0
+  python ppo_dual_continuous.py --train --max_steps 0
   
   # Training with WandB logging
-  python dqn_dual_continuous.py --train --max_steps 1000 --wandb
+  python ppo_dual_continuous.py --train --max_steps 1000 --wandb
+  
+  # Custom update interval (collect more experiences before update)
+  python ppo_dual_continuous.py --train --max_steps 1000 --update_interval 256
         """
     )
     
-    parser.add_argument('--port', type=int, default=5555, 
+    parser.add_argument('--port', type=int, default=5555,
                        help='ZMQ port for NS3 communication (default: 5555)')
-    parser.add_argument('--train', action='store_true', 
+    parser.add_argument('--train', action='store_true',
                        help='Enable training mode (agent learns continuously)')
-    parser.add_argument('--eval', action='store_true', 
+    parser.add_argument('--eval', action='store_true',
                        help='Enable evaluation mode (no learning, exploitation only)')
-    parser.add_argument('--max_steps', type=int, default=0, 
+    parser.add_argument('--max_steps', type=int, default=0,
                        help='Maximum steps (0=unlimited, default: 0)')
-    parser.add_argument('--save_interval', type=int, default=100, 
+    parser.add_argument('--save_interval', type=int, default=100,
                        help='Save model every N steps (default: 100)')
-    parser.add_argument('--model', type=str, default=None, 
+    parser.add_argument('--model', type=str, default=None,
                        help='Path to model file to load')
     parser.add_argument('--wandb', action='store_true',
                        help='Enable Weights & Biases logging (requires: pip install wandb)')
+    parser.add_argument('--update_interval', type=int, default=128,
+                       help='PPO update interval in timesteps (default: 128)')
     
     args = parser.parse_args()
     
     # Default to training mode if neither specified
     train_mode = args.train or not args.eval
     
-    run_dual_control_dqn(
+    # Create agent with custom update interval if specified
+    run_dual_control_ppo(
         port=args.port,
         train=train_mode,
         max_steps=args.max_steps,

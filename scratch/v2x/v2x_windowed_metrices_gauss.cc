@@ -46,6 +46,17 @@ Ptr<RLInterface> g_rlInterface;
 double g_previousPDR = 0.0;
 double g_previousThroughput = 0.0;
 
+// NEW: Windowed metrics for continuous learning
+struct MetricsWindow {
+    uint64_t packetsSent = 0;
+    uint64_t packetsReceived = 0;
+    uint64_t expectedReceptions = 0;
+    Time windowStart = Seconds(0);
+};
+
+std::map<uint32_t, MetricsWindow> g_currentWindow;  // Current measurement window
+std::map<uint32_t, MetricsWindow> g_previousWindow; // Previous window (for comparison)
+
 // NEW: Track neighbors in range at transmission time
 void UpdateExpectedReceptions(uint32_t senderNodeId) {
     // When a node sends a packet, count how many nodes are in range
@@ -64,6 +75,7 @@ void UpdateExpectedReceptions(uint32_t senderNodeId) {
         if (distance <= commRange) {
             // This node is in range, so it SHOULD receive this packet
             g_expectedReceptions[i]++;
+            g_currentWindow[i].expectedReceptions++;  // Track in current window
         }
     }
 }
@@ -78,6 +90,7 @@ void TxCallback(std::string context, Ptr<const Packet> packet) {
         if (end != std::string::npos) {
             uint32_t nodeId = std::stoul(context.substr(start, end - start));
             g_packetsSent[nodeId]++;
+            g_currentWindow[nodeId].packetsSent++;  // Track in current window
             // NEW: Update expected receptions for all nodes in range
             UpdateExpectedReceptions(nodeId);
         }
@@ -94,6 +107,7 @@ void RxCallback(std::string context, Ptr<const Packet> packet, const Address &ad
         if (end != std::string::npos) {
             uint32_t nodeId = std::stoul(context.substr(start, end - start));
             g_packetsReceived[nodeId]++;
+            g_currentWindow[nodeId].packetsReceived++;  // Track in current window
         }
     }
 }
@@ -147,14 +161,24 @@ double CalculateCBR(Ptr<Node> node) {
     Time currentTime = Simulator::Now();
     Time timeSinceLastSample = currentTime - g_lastChannelSampleTime[nodeId];
     
-    if (timeSinceLastSample.GetSeconds() == 0.0) {
+    if (timeSinceLastSample.GetSeconds() <= 0.0) {
+        g_lastChannelSampleTime[nodeId] = currentTime;
         return 0.0;
     }
     
-    Time busyTime = wifiPhy->GetDelayUntilIdle();
+    // FIXED: Calculate CBR based on packet rate and airtime
+    // CBR ≈ (packets/sec * packet_duration) / interval
+    double beaconHz = 1.0 / g_beaconInterval;
+    double packetDuration = 0.001; // ~1ms for 200 byte packet at 6 Mbps
+    double numNeighbors = CountNeighbors(node, 300.0);
+    
+    // Each neighbor transmits beaconHz packets/sec
+    // This node hears all of them
+    double cbr = std::min(1.0, numNeighbors * beaconHz * packetDuration);
+    
     g_lastChannelSampleTime[nodeId] = currentTime;
     
-    return std::min(1.0, busyTime.GetSeconds());
+    return cbr;
 }
 
 // NEW: Get average CBR across all nodes
@@ -178,74 +202,115 @@ void UpdateTxPower(double newPower);
 
 // Calculate reward based on network performance
 double CalculateReward(double pdr, double throughput, double avgNeighbors, double cbr) {
-    // IMPROVED REWARD FUNCTION WITH CONGESTION AWARENESS
-    // Goal: High PDR, Good throughput, Reasonable beaconHz, Low congestion
+    // CRITICAL FIX: Reward function should heavily penalize poor PDR
     
     double beaconHz = 1.0 / g_beaconInterval;
     
-    // 1. PDR reward (most important): 0-40 points
-    double pdrReward = pdr * 40.0;
+    // 1. PDR reward (MOST CRITICAL): Use exponential scaling to heavily penalize low PDR
+    double pdrReward = 0.0;
+    if (pdr < 0.3) {
+        // Severe penalty for very low PDR
+        pdrReward = -50.0 + (pdr / 0.3) * 30.0; // -50 to -20
+    } else if (pdr < 0.6) {
+        pdrReward = -20.0 + ((pdr - 0.3) / 0.3) * 30.0; // -20 to 10
+    } else if (pdr < 0.8) {
+        pdrReward = 10.0 + ((pdr - 0.6) / 0.2) * 30.0; // 10 to 40
+    } else {
+        pdrReward = 40.0 + ((pdr - 0.8) / 0.2) * 20.0; // 40 to 60
+    }
     
-    // 2. Throughput reward: Optimal around 20-30 kbps
-    double targetThroughput = 25000.0; // 25 kbps target
-    double throughputRatio = throughput / targetThroughput;
+    // 2. Throughput reward: Target 20-40 kbps (realistic for VANET)
+    double targetThroughputMin = 20000.0; // 20 kbps
+    double targetThroughputMax = 40000.0; // 40 kbps
     double throughputReward = 0.0;
     
-    if (throughputRatio < 0.5) {
-        throughputReward = throughputRatio * 20.0; // 0-10 points
-    } else if (throughputRatio <= 1.5) {
-        throughputReward = 10.0 + (1.0 - std::abs(throughputRatio - 1.0)) * 10.0; // 10-20 points
+    if (throughput < targetThroughputMin) {
+        throughputReward = (throughput / targetThroughputMin) * 10.0; // 0-10 points
+    } else if (throughput <= targetThroughputMax) {
+        throughputReward = 10.0 + ((throughput - targetThroughputMin) / 
+                          (targetThroughputMax - targetThroughputMin)) * 10.0; // 10-20 points
     } else {
-        throughputReward = std::max(0.0, 20.0 - (throughputRatio - 1.5) * 10.0);
+        // Penalty for excessive throughput (causes congestion)
+        double excess = (throughput - targetThroughputMax) / targetThroughputMax;
+        throughputReward = std::max(0.0, 20.0 - excess * 30.0);
     }
     
-    // 3. BeaconHz reward: Optimal around 6-10 Hz
+    // 3. BeaconHz reward: Optimal 6-10 Hz for VANET
     double beaconReward = 0.0;
+    double targetBeaconMin = 6.0;
+    double targetBeaconMax = 10.0;
     
-    if (beaconHz < 4.0) {
-        beaconReward = beaconHz * 2.5; // 0-10 points
-    } else if (beaconHz <= 10.0) {
-        beaconReward = 10.0 + (beaconHz - 4.0) * 1.67; // 10-20 points
+    if (beaconHz < targetBeaconMin) {
+        beaconReward = (beaconHz / targetBeaconMin) * 5.0; // 0-5 points (too slow = bad)
+    } else if (beaconHz <= targetBeaconMax) {
+        beaconReward = 5.0 + ((beaconHz - targetBeaconMin) / 
+                      (targetBeaconMax - targetBeaconMin)) * 10.0; // 5-15 points
     } else {
-        beaconReward = std::max(0.0, 20.0 - (beaconHz - 10.0) * 2.0);
+        // Penalty for excessive beacon rate (causes congestion)
+        double excess = (beaconHz - targetBeaconMax) / targetBeaconMax;
+        beaconReward = std::max(-10.0, 15.0 - excess * 25.0);
     }
     
-    // 4. Connectivity reward: More neighbors = better
-    double connectivityReward = std::min(avgNeighbors / 10.0 * 10.0, 10.0); // 0-10 points
+    // 4. Connectivity reward: Target 8-15 neighbors (realistic for 300m range)
+    double connectivityReward = 0.0;
+    if (avgNeighbors < 5.0) {
+        // Too few neighbors = network fragmentation
+        connectivityReward = -10.0 + (avgNeighbors / 5.0) * 10.0; // -10 to 0
+    } else if (avgNeighbors <= 15.0) {
+        connectivityReward = (avgNeighbors / 15.0) * 10.0; // 0-10 points
+    } else {
+        // Too many neighbors is fine (up to a point)
+        connectivityReward = 10.0;
+    }
     
-    // 5. Congestion penalty (NEW): CBR-based
+    // 5. Congestion penalty (CBR-based)
     double congestionPenalty = 0.0;
     
-    if (cbr <= 0.5) {
-        congestionPenalty = 0.0;
-    } else if (cbr <= 0.7) {
-        congestionPenalty = (cbr - 0.5) / 0.2 * 10.0; // 0-10 points penalty
-    } else {
-        congestionPenalty = 10.0 + (cbr - 0.7) / 0.3 * 15.0; // 10-25 points penalty
+    if (cbr > 0.3) {
+        // CBR above 0.3 indicates channel congestion
+        congestionPenalty = (cbr - 0.3) / 0.7 * 20.0; // 0-20 penalty
     }
     
     // 6. Stability penalty
     double stabilityPenalty = 0.0;
-    if (pdr < 0.5) stabilityPenalty += 5.0;
-    if (avgNeighbors < 3.0) stabilityPenalty += 5.0;
+    if (pdr < 0.4) stabilityPenalty += 10.0; // Severe PDR penalty
+    if (avgNeighbors < 3.0) stabilityPenalty += 10.0; // Network fragmentation
+    if (beaconHz < 2.0 || beaconHz > 15.0) stabilityPenalty += 5.0; // Extreme beacon rates
     
-    // Total reward
+    // Total reward (can be negative!)
     double totalReward = pdrReward + throughputReward + beaconReward + 
                         connectivityReward - stabilityPenalty - congestionPenalty;
     
-    totalReward = std::max(0.0, totalReward);
+    // Don't clamp to 0 - allow negative rewards to punish bad behavior!
     
     // Debug output
     std::cout << "[Reward Breakdown]" << std::endl;
-    std::cout << "  PDR:          " << std::fixed << std::setprecision(2) << pdrReward << std::endl;
-    std::cout << "  Throughput:   " << throughputReward << std::endl;
-    std::cout << "  BeaconHz:     " << beaconReward << " (current: " << beaconHz << " Hz)" << std::endl;
-    std::cout << "  Connectivity: " << connectivityReward << std::endl;
-    std::cout << "  Congestion:   -" << congestionPenalty << " (CBR: " << std::setprecision(3) << cbr << ")" << std::endl;
-    std::cout << "  Penalty:      -" << stabilityPenalty << std::endl;
+    std::cout << "  PDR:          " << std::fixed << std::setprecision(2) << pdrReward 
+              << " (PDR: " << std::setprecision(3) << pdr << ")" << std::endl;
+    std::cout << "  Throughput:   " << throughputReward 
+              << " (Tput: " << (int)(throughput/1000) << " kbps)" << std::endl;
+    std::cout << "  BeaconHz:     " << beaconReward << " (Hz: " << beaconHz << ")" << std::endl;
+    std::cout << "  Connectivity: " << connectivityReward 
+              << " (Neighbors: " << avgNeighbors << ")" << std::endl;
+    std::cout << "  Congestion:   -" << congestionPenalty << " (CBR: " << cbr << ")" << std::endl;
+    std::cout << "  Stability:    -" << stabilityPenalty << std::endl;
     std::cout << "  TOTAL:        " << totalReward << std::endl;
     
     return totalReward;
+}
+
+// Reset windowed metrics for next measurement interval
+void ResetMetricsWindow() {
+    for (uint32_t i = 0; i < g_nodes.GetN(); i++) {
+        // Save current window to previous (for debugging/comparison)
+        g_previousWindow[i] = g_currentWindow[i];
+        
+        // Reset current window
+        g_currentWindow[i].packetsSent = 0;
+        g_currentWindow[i].packetsReceived = 0;
+        g_currentWindow[i].expectedReceptions = 0;
+        g_currentWindow[i].windowStart = Simulator::Now();
+    }
 }
 
 // Log metrics and interact with RL agent
@@ -257,24 +322,37 @@ void LogMetrics() {
               << " | TxPower: " << g_txPower << " dBm" << std::endl;
     std::cout << "========================================" << std::endl;
     
-    uint64_t totalSent = 0, totalRecv = 0;
-    uint64_t totalExpectedRecv = 0; // NEW: realistic expected receptions
+    // Calculate WINDOWED metrics (last logging interval)
+    uint64_t windowSent = 0, windowRecv = 0, windowExpected = 0;
+    uint64_t totalSent = 0, totalRecv = 0, totalExpectedRecv = 0;
     
     for (uint32_t i = 0; i < g_nodes.GetN(); i++) {
         Ptr<Node> node = g_nodes.Get(i);
         uint32_t nodeId = node->GetId();
         
+        // WINDOWED counts (last interval only)
+        uint64_t sent_window = g_currentWindow[nodeId].packetsSent;
+        uint64_t recv_window = g_currentWindow[nodeId].packetsReceived;
+        uint64_t expected_window = g_currentWindow[nodeId].expectedReceptions;
+        
+        windowSent += sent_window;
+        windowRecv += recv_window;
+        windowExpected += expected_window;
+        
+        // Cumulative counts (for display)
         uint64_t sent = g_packetsSent[nodeId];
         uint64_t recv = g_packetsReceived[nodeId];
-        uint64_t expectedRecv = g_expectedReceptions[nodeId]; // NEW: realistic expectation
+        uint64_t expectedRecv = g_expectedReceptions[nodeId];
         totalSent += sent;
         totalRecv += recv;
         totalExpectedRecv += expectedRecv;
         
-        // NEW: PDR based on realistic expected receptions (only from nodes in range)
-        double nodePDR = (expectedRecv > 0) ? (double)recv / expectedRecv : 0.0;
+        // PDR from WINDOWED data (more responsive!)
+        double nodePDR_window = (expected_window > 0) ? (double)recv_window / expected_window : 0.0;
         
-        double throughput = (recv * 200 * 8) / currentTime;
+        // Throughput from WINDOWED data
+        double windowDuration = g_loggingInterval;
+        double throughput_window = (recv_window * 200 * 8) / windowDuration;
         
         Ptr<MobilityModel> mobility = node->GetObject<MobilityModel>();
         Vector pos = mobility->GetPosition();
@@ -286,57 +364,63 @@ void LogMetrics() {
         std::cout << "Node[" << std::setw(2) << nodeId << "]"
                   << " Sent:" << std::setw(5) << sent
                   << " Recv:" << std::setw(5) << recv
-                  << " Exp:" << std::setw(5) << expectedRecv  // NEW: show expected
-                  << " PDR:" << std::fixed << std::setprecision(3) << std::setw(6) << nodePDR
-                  << " Tput:" << std::setw(8) << (int)throughput << "bps"
+                  << " (W:" << std::setw(4) << recv_window << ")"  // Show window recv
+                  << " PDR:" << std::fixed << std::setprecision(3) << std::setw(6) << nodePDR_window
+                  << " Tput:" << std::setw(8) << (int)throughput_window << "bps"
                   << " | Pos(" << std::setw(4) << (int)pos.x << "," << std::setw(2) << (int)pos.y << ")"
                   << " Vel(" << std::setw(2) << (int)vel.x << ",0)"
                   << " Neigh:" << std::setw(2) << neighbors
-                  << " Dist:" << std::setw(4) << (int)avgDist << "m"
                   << std::endl;
     }
     
-    // NEW: Global PDR using realistic expected receptions
-    double globalPDR = (totalExpectedRecv > 0) ? (double)totalRecv / totalExpectedRecv : 0.0;
+    // WINDOWED global PDR (what RL agent should see!)
+    double windowPDR = (windowExpected > 0) ? (double)windowRecv / windowExpected : 0.0;
     
-    // Calculate average metrics
-    double avgThroughput = 0.0, avgNeighbors = 0.0;
+    // CUMULATIVE global PDR (for reference)
+    double cumulativePDR = (totalExpectedRecv > 0) ? (double)totalRecv / totalExpectedRecv : 0.0;
+    
+    // Calculate WINDOWED average metrics
+    double avgThroughput_window = 0.0, avgNeighbors = 0.0;
     for (uint32_t i = 0; i < g_nodes.GetN(); i++) {
         Ptr<Node> node = g_nodes.Get(i);
         uint32_t nodeId = node->GetId();
-        uint64_t recv = g_packetsReceived[nodeId];
-        double throughput = (recv * 200 * 8) / currentTime;
-        avgThroughput += throughput;
+        
+        uint64_t recv_window = g_currentWindow[nodeId].packetsReceived;
+        double throughput_window = (recv_window * 200 * 8) / g_loggingInterval;
+        avgThroughput_window += throughput_window;
         avgNeighbors += CountNeighbors(node, 300.0);
     }
-    avgThroughput /= g_nodes.GetN();
+    avgThroughput_window /= g_nodes.GetN();
     avgNeighbors /= g_nodes.GetN();
     
     // NEW: Calculate average Channel Busy Ratio
     double avgCBR = GetAverageCBR();
     
     std::cout << "========================================" << std::endl;
-    std::cout << "TOTAL Sent:" << totalSent << " Recv:" << totalRecv 
-              << " Expected:" << totalExpectedRecv  // NEW: show total expected
-              << " GlobalPDR:" << std::fixed << std::setprecision(3) << globalPDR 
+    std::cout << "WINDOW Sent:" << windowSent << " Recv:" << windowRecv 
+              << " Expected:" << windowExpected 
+              << " PDR:" << std::fixed << std::setprecision(3) << windowPDR << std::endl;
+    std::cout << "CUMULATIVE Sent:" << totalSent << " Recv:" << totalRecv 
+              << " PDR:" << cumulativePDR << std::endl;
+    std::cout << "AvgThroughput:" << (int)avgThroughput_window << "bps/node"
               << " AvgNeighbors:" << std::setprecision(1) << avgNeighbors 
-              << " CBR:" << std::setprecision(3) << avgCBR << std::endl;  // NEW: show CBR
-    std::cout << std::endl;
+              << " CBR:" << std::setprecision(3) << avgCBR << std::endl;
+    std::cout << "========================================" << std::endl << std::endl;
     
-    // RL Agent Interaction
+    // RL Agent Interaction - USE WINDOWED METRICS!
     if (g_enableRL && g_rlInterface) {
-        // Build state dictionary
+        // Build state dictionary with WINDOWED metrics
         std::map<std::string, double> state;
         state["time"] = currentTime;
-        state["PDR"] = globalPDR;
-        state["throughput"] = avgThroughput;
-        state["packetsSent"] = totalSent;
-        state["packetsReceived"] = totalRecv;
+        state["PDR"] = windowPDR;  // WINDOWED PDR, not cumulative!
+        state["throughput"] = avgThroughput_window;  // WINDOWED throughput!
+        state["packetsSent"] = windowSent;  // WINDOWED count
+        state["packetsReceived"] = windowRecv;  // WINDOWED count
         state["avgNeighbors"] = avgNeighbors;
         state["beaconHz"] = 1.0 / g_beaconInterval;
         state["txPower"] = g_txPower;
         state["numVehicles"] = g_nodes.GetN();
-        state["CBR"] = avgCBR;  // NEW: Add Channel Busy Ratio
+        state["CBR"] = avgCBR;  // Channel Busy Ratio
         
         // Send state to RL agent
         g_rlInterface->SendState(state);
@@ -363,10 +447,10 @@ void LogMetrics() {
             }
         }
         
-        // Calculate reward (including CBR/congestion)
-        double reward = CalculateReward(globalPDR, avgThroughput, avgNeighbors, avgCBR);
+        // Calculate reward from WINDOWED metrics
+        double reward = CalculateReward(windowPDR, avgThroughput_window, avgNeighbors, avgCBR);
         
-        // Check if simulation is done
+        // For continuous learning, 'done' should always be false (except at end)
         bool done = (currentTime >= g_simulationTime - g_loggingInterval - 0.1);
         
         // Send reward to RL agent
@@ -375,10 +459,10 @@ void LogMetrics() {
         std::cout << ">>> RL Reward: " << std::fixed << std::setprecision(3) 
                   << reward << " | Done: " << (done ? "Yes" : "No") << " <<<" << std::endl;
         std::cout << std::endl;
-        
-        g_previousPDR = globalPDR;
-        g_previousThroughput = avgThroughput;
     }
+    
+    // RESET WINDOW for next interval (CRITICAL for continuous learning!)
+    ResetMetricsWindow();
     
     if (currentTime < g_simulationTime - 0.1) {
         Simulator::Schedule(Seconds(g_loggingInterval), &LogMetrics);
@@ -464,6 +548,10 @@ int main(int argc, char *argv[]) {
     wifiPhy.Set("TxPowerStart", DoubleValue(g_txPower));
     wifiPhy.Set("TxPowerEnd", DoubleValue(g_txPower));
     
+    // Configure MAC layer to reduce collisions
+    Config::SetDefault("ns3::WifiMacQueue::MaxSize", QueueSizeValue(QueueSize("400p")));
+    Config::SetDefault("ns3::WifiMacQueue::MaxDelay", TimeValue(Seconds(0.5)));
+    
     WifiHelper wifi;
     wifi.SetStandard(WIFI_STANDARD_80211p);
     wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
@@ -474,27 +562,42 @@ int main(int argc, char *argv[]) {
     
     g_devices = wifi.Install(wifiPhy, wifiMac, g_nodes);
     
-    // Mobility
+    // Mobility - Realistic Highway Scenario
     MobilityHelper mobility;
+    
+    // Define highway parameters
+    double highwayLength = 3000.0;  // 3 km circular highway
+    double laneWidth = 3.5;         // Standard lane width (meters)
+    uint32_t numLanes = 4;
+    
+    // Use GaussMarkovMobilityModel for realistic vehicle movement
+    // Attributes use RandomVariableStream (StringValue), not direct double values
+    mobility.SetMobilityModel("ns3::GaussMarkovMobilityModel",
+                             "Bounds", BoxValue(Box(0, highwayLength, 0, numLanes * laneWidth, 0, 0)),
+                             "TimeStep", TimeValue(Seconds(0.5)),
+                             "Alpha", DoubleValue(0.85),  // Higher = smoother movement (memory effect)
+                             "MeanVelocity", StringValue("ns3::UniformRandomVariable[Min=22.0|Max=33.0]"),  // 79-119 km/h
+                             "MeanDirection", StringValue("ns3::UniformRandomVariable[Min=0.0|Max=0.1]"),   // Mostly X-axis (0-5.7 degrees)
+                             "MeanPitch", StringValue("ns3::ConstantRandomVariable[Constant=0.0]"),
+                             "NormalVelocity", StringValue("ns3::NormalRandomVariable[Mean=0.0|Variance=3.0|Bound=10.0]"),
+                             "NormalDirection", StringValue("ns3::NormalRandomVariable[Mean=0.0|Variance=0.2|Bound=0.5]"),
+                             "NormalPitch", StringValue("ns3::NormalRandomVariable[Mean=0.0|Variance=0.0|Bound=0.0]"));
+    
+    // Set initial positions along highway lanes
     Ptr<ListPositionAllocator> posAlloc = CreateObject<ListPositionAllocator>();
     
     for (uint32_t i = 0; i < g_numVehicles; i++) {
-        uint32_t lane = i % 4;
-        double x = (i / 4) * 50.0;
-        double y = lane * 3.5;
+        uint32_t lane = i % numLanes;
+        double x = ((i / numLanes) * 30.0);  // Spread vehicles every 30m
+        // Wrap around if exceeds highway length
+        while (x >= highwayLength) x -= highwayLength;
+        
+        double y = lane * laneWidth + laneWidth / 2.0;  // Center of lane
         posAlloc->Add(Vector(x, y, 0.0));
     }
     
     mobility.SetPositionAllocator(posAlloc);
-    mobility.SetMobilityModel("ns3::ConstantVelocityMobilityModel");
     mobility.Install(g_nodes);
-    
-    for (uint32_t i = 0; i < g_nodes.GetN(); i++) {
-        Ptr<ConstantVelocityMobilityModel> mob = 
-            g_nodes.Get(i)->GetObject<ConstantVelocityMobilityModel>();
-        double speed = 25.0 + (rand() % 3);
-        mob->SetVelocity(Vector(speed, 0.0, 0.0));
-    }
     
     // Internet stack
     InternetStackHelper internet;
@@ -516,14 +619,29 @@ int main(int argc, char *argv[]) {
         sinkApp.Start(Seconds(0.0));
         sinkApp.Stop(Seconds(g_simulationTime));
         
-        // Sender
+        // Sender - CRITICAL FIXES for collision reduction
         OnOffHelper onoff("ns3::UdpSocketFactory",
                          InetSocketAddress(Ipv4Address("10.1.255.255"), port));
         onoff.SetConstantRate(DataRate((200 * 8) / g_beaconInterval));
         onoff.SetAttribute("PacketSize", UintegerValue(200));
         
+        // FIX 1: Use exponential distribution for OnTime to add randomness
+        // This prevents synchronized periodic transmissions that cause collisions
+        std::stringstream onTimeStream;
+        onTimeStream << "ns3::ExponentialRandomVariable[Mean=" << g_beaconInterval << "]";
+        onoff.SetAttribute("OnTime", StringValue(onTimeStream.str()));
+        onoff.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0.0]"));
+        
         ApplicationContainer app = onoff.Install(g_nodes.Get(i));
-        app.Start(Seconds(1.0 + i * 0.01));
+        
+        // FIX 2: Randomize start times across full beacon interval
+        // This spreads initial transmissions to avoid synchronized starts
+        Ptr<UniformRandomVariable> startTimeRandom = CreateObject<UniformRandomVariable>();
+        startTimeRandom->SetAttribute("Min", DoubleValue(1.0));
+        startTimeRandom->SetAttribute("Max", DoubleValue(1.0 + g_beaconInterval));
+        double startTime = startTimeRandom->GetValue();
+        
+        app.Start(Seconds(startTime));
         app.Stop(Seconds(g_simulationTime));
         
         // Store the OnOff app for runtime updates
@@ -543,6 +661,11 @@ int main(int argc, char *argv[]) {
         g_expectedReceptions[i] = 0;  // NEW: initialize expected receptions
         g_channelBusyTime[i] = Seconds(0.0);  // NEW: initialize CBR tracking
         g_lastChannelSampleTime[i] = Seconds(0.0);  // NEW: initialize CBR tracking
+        
+        // NEW: Initialize windowed metrics for continuous learning
+        g_currentWindow[i] = MetricsWindow();
+        g_previousWindow[i] = MetricsWindow();
+        g_currentWindow[i].windowStart = Seconds(0.0);
     }
     
     // Schedule logging

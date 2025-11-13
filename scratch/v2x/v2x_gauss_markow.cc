@@ -147,14 +147,24 @@ double CalculateCBR(Ptr<Node> node) {
     Time currentTime = Simulator::Now();
     Time timeSinceLastSample = currentTime - g_lastChannelSampleTime[nodeId];
     
-    if (timeSinceLastSample.GetSeconds() == 0.0) {
+    if (timeSinceLastSample.GetSeconds() <= 0.0) {
+        g_lastChannelSampleTime[nodeId] = currentTime;
         return 0.0;
     }
     
-    Time busyTime = wifiPhy->GetDelayUntilIdle();
+    // FIXED: Calculate CBR based on packet rate and airtime
+    // CBR ≈ (packets/sec * packet_duration) / interval
+    double beaconHz = 1.0 / g_beaconInterval;
+    double packetDuration = 0.001; // ~1ms for 200 byte packet at 6 Mbps
+    double numNeighbors = CountNeighbors(node, 300.0);
+    
+    // Each neighbor transmits beaconHz packets/sec
+    // This node hears all of them
+    double cbr = std::min(1.0, numNeighbors * beaconHz * packetDuration);
+    
     g_lastChannelSampleTime[nodeId] = currentTime;
     
-    return std::min(1.0, busyTime.GetSeconds());
+    return cbr;
 }
 
 // NEW: Get average CBR across all nodes
@@ -178,71 +188,98 @@ void UpdateTxPower(double newPower);
 
 // Calculate reward based on network performance
 double CalculateReward(double pdr, double throughput, double avgNeighbors, double cbr) {
-    // IMPROVED REWARD FUNCTION WITH CONGESTION AWARENESS
-    // Goal: High PDR, Good throughput, Reasonable beaconHz, Low congestion
+    // CRITICAL FIX: Reward function should heavily penalize poor PDR
     
     double beaconHz = 1.0 / g_beaconInterval;
     
-    // 1. PDR reward (most important): 0-40 points
-    double pdrReward = pdr * 40.0;
+    // 1. PDR reward (MOST CRITICAL): Use exponential scaling to heavily penalize low PDR
+    double pdrReward = 0.0;
+    if (pdr < 0.3) {
+        // Severe penalty for very low PDR
+        pdrReward = -50.0 + (pdr / 0.3) * 30.0; // -50 to -20
+    } else if (pdr < 0.6) {
+        pdrReward = -20.0 + ((pdr - 0.3) / 0.3) * 30.0; // -20 to 10
+    } else if (pdr < 0.8) {
+        pdrReward = 10.0 + ((pdr - 0.6) / 0.2) * 30.0; // 10 to 40
+    } else {
+        pdrReward = 40.0 + ((pdr - 0.8) / 0.2) * 20.0; // 40 to 60
+    }
     
-    // 2. Throughput reward: Optimal around 20-30 kbps
-    double targetThroughput = 25000.0; // 25 kbps target
-    double throughputRatio = throughput / targetThroughput;
+    // 2. Throughput reward: Target 20-40 kbps (realistic for VANET)
+    double targetThroughputMin = 20000.0; // 20 kbps
+    double targetThroughputMax = 40000.0; // 40 kbps
     double throughputReward = 0.0;
     
-    if (throughputRatio < 0.5) {
-        throughputReward = throughputRatio * 20.0; // 0-10 points
-    } else if (throughputRatio <= 1.5) {
-        throughputReward = 10.0 + (1.0 - std::abs(throughputRatio - 1.0)) * 10.0; // 10-20 points
+    if (throughput < targetThroughputMin) {
+        throughputReward = (throughput / targetThroughputMin) * 10.0; // 0-10 points
+    } else if (throughput <= targetThroughputMax) {
+        throughputReward = 10.0 + ((throughput - targetThroughputMin) / 
+                          (targetThroughputMax - targetThroughputMin)) * 10.0; // 10-20 points
     } else {
-        throughputReward = std::max(0.0, 20.0 - (throughputRatio - 1.5) * 10.0);
+        // Penalty for excessive throughput (causes congestion)
+        double excess = (throughput - targetThroughputMax) / targetThroughputMax;
+        throughputReward = std::max(0.0, 20.0 - excess * 30.0);
     }
     
-    // 3. BeaconHz reward: Optimal around 6-10 Hz
+    // 3. BeaconHz reward: Optimal 6-10 Hz for VANET
     double beaconReward = 0.0;
+    double targetBeaconMin = 6.0;
+    double targetBeaconMax = 10.0;
     
-    if (beaconHz < 4.0) {
-        beaconReward = beaconHz * 2.5; // 0-10 points
-    } else if (beaconHz <= 10.0) {
-        beaconReward = 10.0 + (beaconHz - 4.0) * 1.67; // 10-20 points
+    if (beaconHz < targetBeaconMin) {
+        beaconReward = (beaconHz / targetBeaconMin) * 5.0; // 0-5 points (too slow = bad)
+    } else if (beaconHz <= targetBeaconMax) {
+        beaconReward = 5.0 + ((beaconHz - targetBeaconMin) / 
+                      (targetBeaconMax - targetBeaconMin)) * 10.0; // 5-15 points
     } else {
-        beaconReward = std::max(0.0, 20.0 - (beaconHz - 10.0) * 2.0);
+        // Penalty for excessive beacon rate (causes congestion)
+        double excess = (beaconHz - targetBeaconMax) / targetBeaconMax;
+        beaconReward = std::max(-10.0, 15.0 - excess * 25.0);
     }
     
-    // 4. Connectivity reward: More neighbors = better
-    double connectivityReward = std::min(avgNeighbors / 10.0 * 10.0, 10.0); // 0-10 points
+    // 4. Connectivity reward: Target 8-15 neighbors (realistic for 300m range)
+    double connectivityReward = 0.0;
+    if (avgNeighbors < 5.0) {
+        // Too few neighbors = network fragmentation
+        connectivityReward = -10.0 + (avgNeighbors / 5.0) * 10.0; // -10 to 0
+    } else if (avgNeighbors <= 15.0) {
+        connectivityReward = (avgNeighbors / 15.0) * 10.0; // 0-10 points
+    } else {
+        // Too many neighbors is fine (up to a point)
+        connectivityReward = 10.0;
+    }
     
-    // 5. Congestion penalty (NEW): CBR-based
+    // 5. Congestion penalty (CBR-based)
     double congestionPenalty = 0.0;
     
-    if (cbr <= 0.5) {
-        congestionPenalty = 0.0;
-    } else if (cbr <= 0.7) {
-        congestionPenalty = (cbr - 0.5) / 0.2 * 10.0; // 0-10 points penalty
-    } else {
-        congestionPenalty = 10.0 + (cbr - 0.7) / 0.3 * 15.0; // 10-25 points penalty
+    if (cbr > 0.3) {
+        // CBR above 0.3 indicates channel congestion
+        congestionPenalty = (cbr - 0.3) / 0.7 * 20.0; // 0-20 penalty
     }
     
     // 6. Stability penalty
     double stabilityPenalty = 0.0;
-    if (pdr < 0.5) stabilityPenalty += 5.0;
-    if (avgNeighbors < 3.0) stabilityPenalty += 5.0;
+    if (pdr < 0.4) stabilityPenalty += 10.0; // Severe PDR penalty
+    if (avgNeighbors < 3.0) stabilityPenalty += 10.0; // Network fragmentation
+    if (beaconHz < 2.0 || beaconHz > 15.0) stabilityPenalty += 5.0; // Extreme beacon rates
     
-    // Total reward
+    // Total reward (can be negative!)
     double totalReward = pdrReward + throughputReward + beaconReward + 
                         connectivityReward - stabilityPenalty - congestionPenalty;
     
-    totalReward = std::max(0.0, totalReward);
+    // Don't clamp to 0 - allow negative rewards to punish bad behavior!
     
     // Debug output
     std::cout << "[Reward Breakdown]" << std::endl;
-    std::cout << "  PDR:          " << std::fixed << std::setprecision(2) << pdrReward << std::endl;
-    std::cout << "  Throughput:   " << throughputReward << std::endl;
-    std::cout << "  BeaconHz:     " << beaconReward << " (current: " << beaconHz << " Hz)" << std::endl;
-    std::cout << "  Connectivity: " << connectivityReward << std::endl;
-    std::cout << "  Congestion:   -" << congestionPenalty << " (CBR: " << std::setprecision(3) << cbr << ")" << std::endl;
-    std::cout << "  Penalty:      -" << stabilityPenalty << std::endl;
+    std::cout << "  PDR:          " << std::fixed << std::setprecision(2) << pdrReward 
+              << " (PDR: " << std::setprecision(3) << pdr << ")" << std::endl;
+    std::cout << "  Throughput:   " << throughputReward 
+              << " (Tput: " << (int)(throughput/1000) << " kbps)" << std::endl;
+    std::cout << "  BeaconHz:     " << beaconReward << " (Hz: " << beaconHz << ")" << std::endl;
+    std::cout << "  Connectivity: " << connectivityReward 
+              << " (Neighbors: " << avgNeighbors << ")" << std::endl;
+    std::cout << "  Congestion:   -" << congestionPenalty << " (CBR: " << cbr << ")" << std::endl;
+    std::cout << "  Stability:    -" << stabilityPenalty << std::endl;
     std::cout << "  TOTAL:        " << totalReward << std::endl;
     
     return totalReward;
@@ -474,27 +511,42 @@ int main(int argc, char *argv[]) {
     
     g_devices = wifi.Install(wifiPhy, wifiMac, g_nodes);
     
-    // Mobility
+    // Mobility - Realistic Highway Scenario
     MobilityHelper mobility;
+    
+    // Define highway parameters
+    double highwayLength = 3000.0;  // 3 km circular highway
+    double laneWidth = 3.5;         // Standard lane width (meters)
+    uint32_t numLanes = 4;
+    
+    // Use GaussMarkovMobilityModel for realistic vehicle movement
+    // Attributes use RandomVariableStream (StringValue), not direct double values
+    mobility.SetMobilityModel("ns3::GaussMarkovMobilityModel",
+                             "Bounds", BoxValue(Box(0, highwayLength, 0, numLanes * laneWidth, 0, 0)),
+                             "TimeStep", TimeValue(Seconds(0.5)),
+                             "Alpha", DoubleValue(0.85),  // Higher = smoother movement (memory effect)
+                             "MeanVelocity", StringValue("ns3::UniformRandomVariable[Min=22.0|Max=33.0]"),  // 79-119 km/h
+                             "MeanDirection", StringValue("ns3::UniformRandomVariable[Min=0.0|Max=0.1]"),   // Mostly X-axis (0-5.7 degrees)
+                             "MeanPitch", StringValue("ns3::ConstantRandomVariable[Constant=0.0]"),
+                             "NormalVelocity", StringValue("ns3::NormalRandomVariable[Mean=0.0|Variance=3.0|Bound=10.0]"),
+                             "NormalDirection", StringValue("ns3::NormalRandomVariable[Mean=0.0|Variance=0.2|Bound=0.5]"),
+                             "NormalPitch", StringValue("ns3::NormalRandomVariable[Mean=0.0|Variance=0.0|Bound=0.0]"));
+    
+    // Set initial positions along highway lanes
     Ptr<ListPositionAllocator> posAlloc = CreateObject<ListPositionAllocator>();
     
     for (uint32_t i = 0; i < g_numVehicles; i++) {
-        uint32_t lane = i % 4;
-        double x = (i / 4) * 50.0;
-        double y = lane * 3.5;
+        uint32_t lane = i % numLanes;
+        double x = ((i / numLanes) * 30.0);  // Spread vehicles every 30m
+        // Wrap around if exceeds highway length
+        while (x >= highwayLength) x -= highwayLength;
+        
+        double y = lane * laneWidth + laneWidth / 2.0;  // Center of lane
         posAlloc->Add(Vector(x, y, 0.0));
     }
     
     mobility.SetPositionAllocator(posAlloc);
-    mobility.SetMobilityModel("ns3::ConstantVelocityMobilityModel");
     mobility.Install(g_nodes);
-    
-    for (uint32_t i = 0; i < g_nodes.GetN(); i++) {
-        Ptr<ConstantVelocityMobilityModel> mob = 
-            g_nodes.Get(i)->GetObject<ConstantVelocityMobilityModel>();
-        double speed = 25.0 + (rand() % 3);
-        mob->SetVelocity(Vector(speed, 0.0, 0.0));
-    }
     
     // Internet stack
     InternetStackHelper internet;
