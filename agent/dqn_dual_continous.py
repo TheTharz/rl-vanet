@@ -336,7 +336,7 @@ def run_dual_control_dqn(port=5555, train=True, max_steps=1000,
     if use_wandb and WANDB_AVAILABLE and train:
         try:
             wandb_run = wandb.init(
-                project="vanet-dqn-both-txpower-beaconhz",
+                project="rl agent training and testing",
                 name=f"dqn_dual_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
                 config={
                     "learning_rate": agent.learning_rate,

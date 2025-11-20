@@ -1,0 +1,29 @@
+[DQN] Using device: cpu
+
+======================================================================
+CONTINUOUS DQN AGENT FOR VANET - BeaconHz Control Only
+======================================================================
+Mode: TRAINING (Learning continuously)
+Port: 5555
+Action Space: 6 actions (BeaconHz: [2, 4, 6, 8, 10, 12])
+TxPower: FIXED at 23 dBm
+Max Steps: Unlimited
+Current Epsilon: 1.0000
+Device: cpu
+======================================================================
+
+Waiting for NS3 simulation to connect...
+
+
+
+[INFO] Training interrupted by user (Ctrl+C)
+[DQN] Model saved to models/dqn_continuous_final_20251107_105407.pth
+
+======================================================================
+FINAL SUMMARY
+======================================================================
+Total Steps: 0
+Total Reward: 0.00
+Final Epsilon: 1.0000
+Replay Buffer Size: 0
+======================================================================

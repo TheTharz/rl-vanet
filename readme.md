@@ -18,9 +18,9 @@ python dqn_dual_continuous.py --train --max_steps 0 --wandb
 python ppo_dual_continuous.py --train --max_steps 0 --wandb
 run the vanet
 
-./build/scratch/v2x/scratch_v2x_v2x --vehicles=60 --simTime=7200 --logInterval=5.0 --beaconHz=8.0 --enableRL=1
+./build/scratch/v2x/scratch_v2x_v2x --vehicles=10 --simTime=7200 --logInterval=5.0 --beaconHz=8.0 --enableRL=1
 
-wandb api key - 
+wandb api key - 6aaafa884d009b3db03e871cd8232cc090d152dd
 
 running the vanet sumo
 ./build/scratch/v2x_sumo/scratch_v2x_sumo_vanet \
@@ -41,4 +41,9 @@ python baseline.py \
   
 python test_model.py --model models/ppo_dual_final_20251112_054517.pth --wandb --wandb_project vanet-ppo-dual-control
 
-python test_baseline.py --beaconHz 8 --txPower 23 --wandb --wandb_project "vanet-ppo-dual-control" --max_steps 1000
+python test_baseline.py --beaconHz 10 --txPower 23 --wandb --wandb_project "rl agent training and testing" --max_steps 10000
+//this is here for testing without rl agent
+
+python test_model.py --model models/ppo_dual_final_20251116_194131.pth --wandb --wandb_project "exhibition" --max_steps 10000
+
+python test_model.py --model models/dqn_dual_final_20251116_192041.pth --wandb --wandb_project "exhibition" --max_steps 10000
